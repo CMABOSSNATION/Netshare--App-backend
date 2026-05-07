@@ -1,224 +1,217 @@
-const { v4: uuidv4 } = require('uuid');
-const logger = require('./logger');
+/**
+ * relay.js — NetShare Relay Server (Updated for Native VPN)
+ *
+ * Session flow:
+ *  1. HOST connects → server assigns 6-char code → HOST gets SESSION_CREATED
+ *  2. CLIENT connects with code → server pairs them → both get JOIN_SUCCESS
+ *  3. Binary packets flow: CLIENT TUN → relay → HOST network stack
+ *  4. Either side disconnects → other side is notified
+ */
 
-// In-memory session store
-// sessions = { CODE: { hostSocket, clients: Map<id, socket>, createdAt, netType } }
+const WebSocket = require('ws');
+
+// ── Session store ─────────────────────────────────────────────────
+// Map of code → { host: ws, clients: Set<ws>, createdAt, netType }
 const sessions = new Map();
 
-// Generate unique 6-char alphanumeric code
+// Map of ws → { role, code, id }
+const connections = new Map();
+
+const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const SESSION_TIMEOUT_MS = parseInt(process.env.SESSION_TIMEOUT_MS) || 3_600_000;
+const MAX_CLIENTS = parseInt(process.env.MAX_CLIENTS_PER_HOST) || 5;
+
 function generateCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  // Ensure uniqueness
-  return sessions.has(code) ? generateCode() : code;
+  let code;
+  do {
+    code = Array.from({ length: 6 }, () =>
+      CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]
+    ).join('');
+  } while (sessions.has(code));
+  return code;
 }
 
-// Send JSON safely to a socket
-function send(socket, data) {
-  try {
-    if (socket && socket.readyState === 1) {
-      socket.send(JSON.stringify(data));
-    }
-  } catch (err) {
-    logger.error(`Send failed: ${err.message}`);
+function send(ws, obj) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
   }
 }
 
-// Broadcast to all clients in a session
-function broadcastToClients(session, data) {
-  session.clients.forEach((clientSocket) => {
-    send(clientSocket, data);
-  });
-}
-
-// Handle HOST_REGISTER message
-function handleHostRegister(socket, payload) {
-  const { netType = 'WiFi' } = payload;
-
-  // Remove any previous session this socket owned
-  sessions.forEach((session, code) => {
-    if (session.hostSocket === socket) {
-      broadcastToClients(session, { type: 'HOST_LEFT', reason: 'Host re-registered' });
-      sessions.delete(code);
-      logger.warn(`Cleaned up old session ${code}`);
-    }
-  });
-
-  const code = generateCode();
-  sessions.set(code, {
-    hostSocket: socket,
-    clients: new Map(),
-    createdAt: Date.now(),
-    netType,
-  });
-
-  socket._sessionCode = code;
-  socket._role = 'host';
-
-  send(socket, { type: 'SESSION_CREATED', code, netType });
-  logger.ok(`Host registered session: ${code} (${netType})`);
-}
-
-// Handle CLIENT_JOIN message
-function handleClientJoin(socket, payload) {
-  const { code } = payload;
-
-  if (!code || !sessions.has(code)) {
-    send(socket, { type: 'JOIN_ERROR', reason: 'Session not found. Check the code.' });
-    logger.warn(`Client tried invalid code: ${code}`);
-    return;
-  }
-
+function cleanupSession(code) {
   const session = sessions.get(code);
+  if (!session) return;
 
-  // Check client limit
-  const maxClients = parseInt(process.env.MAX_CLIENTS_PER_HOST || '5');
-  if (session.clients.size >= maxClients) {
-    send(socket, { type: 'JOIN_ERROR', reason: 'Session is full.' });
-    return;
-  }
-
-  const clientId = uuidv4();
-  socket._clientId = clientId;
-  socket._sessionCode = code;
-  socket._role = 'client';
-
-  session.clients.set(clientId, socket);
-
-  // Notify client
-  send(socket, {
-    type: 'JOIN_SUCCESS',
-    clientId,
-    code,
-    netType: session.netType,
-    message: 'Tunnel active. Traffic is being relayed.',
-  });
-
-  // Notify host
-  send(session.hostSocket, {
-    type: 'CLIENT_CONNECTED',
-    clientId,
-    totalClients: session.clients.size,
-  });
-
-  logger.ok(`Client ${clientId.slice(0,8)} joined session ${code}`);
-}
-
-// Handle HOST_LEAVE
-function handleHostLeave(socket) {
-  const code = socket._sessionCode;
-  if (!code || !sessions.has(code)) return;
-
-  const session = sessions.get(code);
-  broadcastToClients(session, {
-    type: 'HOST_LEFT',
-    reason: 'Host ended the session.',
+  // Notify all clients host left
+  session.clients.forEach(clientWs => {
+    send(clientWs, { type: 'HOST_LEFT', reason: 'Host disconnected' });
+    connections.delete(clientWs);
   });
 
   sessions.delete(code);
-  logger.info(`Host ended session ${code}`);
+  console.log(`[relay] Session ${code} cleaned up`);
 }
 
-// Handle CLIENT_LEAVE
-function handleClientLeave(socket) {
-  const code = socket._sessionCode;
-  const clientId = socket._clientId;
-  if (!code || !sessions.has(code)) return;
-
-  const session = sessions.get(code);
-  session.clients.delete(clientId);
-
-  send(session.hostSocket, {
-    type: 'CLIENT_DISCONNECTED',
-    clientId,
-    totalClients: session.clients.size,
-  });
-
-  logger.info(`Client ${clientId?.slice(0,8)} left session ${code}`);
-}
-
-// Relay data packets between host ↔ client
-function handleDataRelay(socket, payload) {
-  const code = socket._sessionCode;
-  if (!code || !sessions.has(code)) return;
-
-  const session = sessions.get(code);
-
-  if (socket._role === 'host') {
-    // Host → specific client or broadcast
-    const { targetClientId, data } = payload;
-    if (targetClientId && session.clients.has(targetClientId)) {
-      send(session.clients.get(targetClientId), { type: 'DATA', data });
-    } else {
-      broadcastToClients(session, { type: 'DATA', data });
-    }
-  } else if (socket._role === 'client') {
-    // Client → host
-    send(session.hostSocket, {
-      type: 'DATA',
-      fromClientId: socket._clientId,
-      data: payload.data,
+function setupRelay(wss) {
+  // Heartbeat to keep Render connections alive
+  const heartbeat = setInterval(() => {
+    sessions.forEach((session, code) => {
+      // Remove expired sessions
+      if (Date.now() - session.createdAt > SESSION_TIMEOUT_MS) {
+        console.log(`[relay] Session ${code} expired`);
+        cleanupSession(code);
+        return;
+      }
+      // Ping all connections in session
+      if (session.host?.readyState === WebSocket.OPEN) {
+        send(session.host, { type: 'PING' });
+      }
+      session.clients.forEach(ws => send(ws, { type: 'PING' }));
     });
-  }
-}
+  }, 30_000);
 
-// Main message router
-function handleMessage(socket, raw) {
-  let msg;
-  try {
-    msg = JSON.parse(raw);
-  } catch {
-    logger.warn('Received non-JSON message');
-    return;
-  }
+  wss.on('close', () => clearInterval(heartbeat));
 
-  const { type, ...payload } = msg;
+  wss.on('connection', (ws, req) => {
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    console.log(`[relay] New connection from ${ip}`);
 
-  switch (type) {
-    case 'HOST_REGISTER':  handleHostRegister(socket, payload); break;
-    case 'CLIENT_JOIN':    handleClientJoin(socket, payload);   break;
-    case 'HOST_LEAVE':     handleHostLeave(socket);             break;
-    case 'CLIENT_LEAVE':   handleClientLeave(socket);           break;
-    case 'DATA':           handleDataRelay(socket, payload);    break;
-    default:
-      logger.warn(`Unknown message type: ${type}`);
-  }
-}
+    ws.on('message', (data, isBinary) => {
+      // ── Binary packet: raw IP packet forwarding ──────────────
+      if (isBinary) {
+        const conn = connections.get(ws);
+        if (!conn) return;
 
-// Handle socket disconnect (cleanup)
-function handleDisconnect(socket) {
-  if (socket._role === 'host')   handleHostLeave(socket);
-  if (socket._role === 'client') handleClientLeave(socket);
-}
+        const session = sessions.get(conn.code);
+        if (!session) return;
 
-// Stats endpoint data
-function getStats() {
-  const stats = { activeSessions: sessions.size, sessions: [] };
-  sessions.forEach((session, code) => {
-    stats.sessions.push({
-      code,
-      netType: session.netType,
-      clients: session.clients.size,
-      ageSeconds: Math.floor((Date.now() - session.createdAt) / 1000),
+        if (conn.role === 'client') {
+          // CLIENT → HOST: forward packet to host
+          if (session.host?.readyState === WebSocket.OPEN) {
+            session.host.send(data, { binary: true });
+          }
+        } else if (conn.role === 'host') {
+          // HOST → CLIENT: forward response back to originating client
+          // For simplicity, broadcast to all clients (real impl would track per-client)
+          session.clients.forEach(clientWs => {
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(data, { binary: true });
+            }
+          });
+        }
+        return;
+      }
+
+      // ── Text message: control messages ───────────────────────
+      let msg;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
+
+      console.log(`[relay] Message: ${msg.type}`);
+
+      switch (msg.type) {
+
+        case 'HOST_REGISTER': {
+          // Generate session code and register host
+          const code = generateCode();
+          sessions.set(code, {
+            host: ws,
+            clients: new Set(),
+            createdAt: Date.now(),
+            netType: msg.netType || 'WiFi',
+          });
+          connections.set(ws, { role: 'host', code, id: `host-${code}` });
+
+          send(ws, { type: 'SESSION_CREATED', code, netType: msg.netType });
+          console.log(`[relay] Session ${code} created by host`);
+          break;
+        }
+
+        case 'CLIENT_JOIN': {
+          const { code } = msg;
+          if (!code) return send(ws, { type: 'JOIN_ERROR', reason: 'No code provided' });
+
+          const session = sessions.get(code);
+          if (!session) return send(ws, { type: 'JOIN_ERROR', reason: 'Session not found' });
+          if (!session.host || session.host.readyState !== WebSocket.OPEN) {
+            return send(ws, { type: 'JOIN_ERROR', reason: 'Host is offline' });
+          }
+          if (session.clients.size >= MAX_CLIENTS) {
+            return send(ws, { type: 'JOIN_ERROR', reason: 'Session is full' });
+          }
+
+          const clientId = `client-${Date.now()}`;
+          session.clients.add(ws);
+          connections.set(ws, { role: 'client', code, id: clientId });
+
+          send(ws, { type: 'JOIN_SUCCESS', code, netType: session.netType });
+          send(session.host, { type: 'CLIENT_CONNECTED', clientId, totalClients: session.clients.size });
+          console.log(`[relay] Client ${clientId} joined session ${code}`);
+          break;
+        }
+
+        case 'PONG': {
+          // Heartbeat response — no action needed
+          break;
+        }
+
+        case 'HOST_LEAVE': {
+          const conn = connections.get(ws);
+          if (conn?.role === 'host') cleanupSession(conn.code);
+          break;
+        }
+
+        case 'CLIENT_LEAVE': {
+          const conn = connections.get(ws);
+          if (!conn) return;
+          const session = sessions.get(conn.code);
+          if (session) {
+            session.clients.delete(ws);
+            send(session.host, {
+              type: 'CLIENT_DISCONNECTED',
+              clientId: conn.id,
+              totalClients: session.clients.size,
+            });
+          }
+          connections.delete(ws);
+          break;
+        }
+
+        default:
+          console.warn(`[relay] Unknown message type: ${msg.type}`);
+      }
+    });
+
+    ws.on('close', () => {
+      const conn = connections.get(ws);
+      if (!conn) return;
+
+      if (conn.role === 'host') {
+        cleanupSession(conn.code);
+      } else if (conn.role === 'client') {
+        const session = sessions.get(conn.code);
+        if (session) {
+          session.clients.delete(ws);
+          if (session.host?.readyState === WebSocket.OPEN) {
+            send(session.host, {
+              type: 'CLIENT_DISCONNECTED',
+              clientId: conn.id,
+              totalClients: session.clients.size,
+            });
+          }
+        }
+      }
+      connections.delete(ws);
+    });
+
+    ws.on('error', (err) => {
+      console.error(`[relay] WS error: ${err.message}`);
     });
   });
-  return stats;
+
+  console.log('[relay] Relay handler attached to WebSocket server');
 }
 
-// Auto-expire sessions older than SESSION_TIMEOUT_MS
-setInterval(() => {
-  const timeout = parseInt(process.env.SESSION_TIMEOUT_MS || '3600000');
-  sessions.forEach((session, code) => {
-    if (Date.now() - session.createdAt > timeout) {
-      broadcastToClients(session, { type: 'HOST_LEFT', reason: 'Session expired.' });
-      send(session.hostSocket, { type: 'SESSION_EXPIRED' });
-      sessions.delete(code);
-      logger.warn(`Session ${code} expired and removed`);
-    }
-  });
-}, 60_000);
-
-module.exports = { handleMessage, handleDisconnect, getStats };
+module.exports = { setupRelay };
