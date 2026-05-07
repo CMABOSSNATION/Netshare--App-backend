@@ -1,0 +1,24 @@
+{
+  "name": "netshare-backend",
+  "version": "1.0.0",
+  "description": "NetShare relay server - routes internet traffic from host to client",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "http-proxy": "^1.18.1",
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
