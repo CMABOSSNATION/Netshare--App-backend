@@ -214,4 +214,13 @@ function setupRelay(wss) {
   console.log('[relay] Relay handler attached to WebSocket server');
 }
 
-module.exports = { setupRelay };
+
+
+function getStats() {
+  const stats = { activeSessions: sessions.size, totalClients: 0 };
+  sessions.forEach(s => { stats.totalClients += s.clients.size; });
+  return stats;
+}
+
+// Re-export with getStats added
+module.exports = { setupRelay, getStats };
