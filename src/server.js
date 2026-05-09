@@ -175,14 +175,15 @@ function handleHostFailover(deadHostId) {
   console.log(`[failover] Migrated ${migrated} clients from host ${deadHostId} to ${newHostId}`);
 }
 
-// ── Weekly earnings calculation ───────────────────────────────────────
+// ── Host earnings: based on client-hours served ───────────────────────
+// Each client connected to a host for 1 hour = RATE earned by host
 function calculateHostEarnings(hostId) {
   const host = store.hosts.get(hostId);
   if (!host) return 0;
 
-  const HOURLY_RATE = parseFloat(process.env.HOURLY_RATE_PER_HOST) || 1.00; // $1/hr host share
-  const uptimeHours = host.totalUptimeMs / 3_600_000;
-  return Math.round(uptimeHours * HOURLY_RATE * 100) / 100;
+  const CLIENT_HOUR_RATE = parseFloat(process.env.HOURLY_RATE_PER_HOST) || 0.50; // $0.50 per client-hour
+  const clientHours = (host.totalClientHours || 0);
+  return Math.round(clientHours * CLIENT_HOUR_RATE * 100) / 100;
 }
 
 // ── REST: Health ──────────────────────────────────────────────────────
@@ -197,7 +198,11 @@ app.get('/ping', (req, res) => res.json({ pong: true, ts: Date.now() }));
 
 // ── REST: Admin — Generate Access Codes ──────────────────────────────
 app.post('/admin/codes/generate', requireAdmin, (req, res) => {
-  const { count = 1, expiresInDays = 30, label = '' } = req.body;
+  const { count = 1, expiresInHours = 24, expiresInDays, label = '' } = req.body;
+  // Support both hours (new) and days (legacy)
+  const expiryMs = expiresInHours
+    ? expiresInHours * 3_600_000
+    : (expiresInDays || 1) * 86_400_000;
   const generated = [];
 
   for (let i = 0; i < Math.min(count, 100); i++) {
@@ -207,7 +212,7 @@ app.post('/admin/codes/generate', requireAdmin, (req, res) => {
       code,
       label,
       createdAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + expiresInDays * 86_400_000).toISOString(),
+      expiresAt: new Date(Date.now() + expiryMs).toISOString(),
       usedBy: null,
       isActive: true,
     };
@@ -285,6 +290,7 @@ app.post('/admin/payouts/reset', requireAdmin, (req, res) => {
   store.hosts.forEach((host) => {
     host.allTimeEarnings = (host.allTimeEarnings || 0) + calculateHostEarnings(host.hostId);
     host.totalUptimeMs = 0;
+    host.totalClientHours = 0;
   });
   res.json({ success: true, message: 'Weekly uptime reset. New cycle started.' });
 });
@@ -373,6 +379,7 @@ wss.on('connection', (ws, req) => {
           registeredAt: existingHost?.registeredAt || new Date().toISOString(),
           onlineSince: Date.now(),
           totalUptimeMs: uptimeMs,
+          totalClientHours: existingHost?.totalClientHours || 0,
           allTimeEarnings: existingHost?.allTimeEarnings || 0,
           lastSeen: new Date().toISOString(),
           clientCount: 0,
@@ -547,13 +554,21 @@ setInterval(() => {
   store.hosts.forEach((host, hostId) => {
     if (host.ws?.readyState === 1) {
       send(host.ws, { type: 'PING' });
+
+      // Accumulate client-hours: every 30s tick = 30s × clientCount
+      const session = host.sessionCode ? store.sessions.get(host.sessionCode) : null;
+      const activeClients = session ? session.clients.size : 0;
+      if (activeClients > 0) {
+        // 30 seconds × activeClients → convert to hours
+        host.totalClientHours = (host.totalClientHours || 0) + (activeClients * 30 / 3600);
+      }
     } else if (host.isOnline) {
       host.isOnline = false;
       host.totalUptimeMs += (Date.now() - (host.onlineSince || Date.now()));
       handleHostFailover(hostId);
     }
   });
-  store.sessions.forEach((session, code) => {
+  store.sessions.forEach((session) => {
     session.clients.forEach(({ ws }) => {
       if (ws.readyState === 1) send(ws, { type: 'PING' });
     });
