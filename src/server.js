@@ -143,6 +143,10 @@ const store = {
     totalDataRelayed: 0,
     totalEarningsPaid: 0,
     weeklyRevenuePool: 0,
+    // Breakdown by protocol for debugging app-specific issues
+    tcpBytesRelayed: 0,
+    udpBytesRelayed: 0,
+    largeFrameCount: 0,   // frames > 32KB (QUIC CDN bursts from TikTok)
   },
 };
 
@@ -406,6 +410,10 @@ app.get('/admin/stats', requireAdmin, (req, res) => {
     activeAccessCodes: Array.from(store.accessCodes.values()).filter(c => c.isActive).length,
     usedAccessCodes: Array.from(store.accessCodes.values()).filter(c => c.usedBy).length,
     platform: store.stats,
+    relay: {
+      totalMBRelayed: Math.round(store.stats.totalDataRelayed / 1048576 * 100) / 100,
+      largeFrames: store.stats.largeFrameCount,
+    },
   });
 });
 
@@ -443,7 +451,11 @@ app.post('/validate-code', (req, res) => {
 // the WS upgrade request and return 400. Instead, handle the 'upgrade' event
 // directly on the HTTP server so the handshake bypasses Express entirely.
 const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
+// maxPayload: 128 KB — QUIC datagrams from TikTok CDN can be large bursts.
+// Default ws maxPayload is 100MB which is fine, but set explicitly here
+// to document the intent and allow tuning. 128KB covers the largest
+// QUIC/RTP frames while staying well within memory bounds per connection.
+const wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024 });
 
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/relay') {
@@ -467,7 +479,12 @@ wss.on('connection', (ws, req) => {
       if (!conn) return;
       const session = store.sessions.get(conn.sessionCode);
       if (!session) return;
-      store.stats.totalDataRelayed += data.length;
+
+      const frameSize = data.length;
+      store.stats.totalDataRelayed += frameSize;
+
+      // Track oversized frames (QUIC CDN bursts — TikTok, YouTube QUIC)
+      if (frameSize > 32768) store.stats.largeFrameCount++;
 
       if (conn.type === 'client') {
         // CLIENT → HOST: forward packet to the host of this session
@@ -477,8 +494,13 @@ wss.on('connection', (ws, req) => {
         // HOST → CLIENT: route response packet to the correct client using the
         // destination IP from the IPv4 header, which now matches each client's
         // unique assigned TUN IP (10.8.0.2, 10.8.0.3, …).
+        // For IPv6 frames (version nibble = 6, dst at bytes 24–39) we broadcast
+        // since IPv6 TUN routing is per-client address; the client TUN filters.
         let forwarded = false;
-        if (data.length >= 20) {
+
+        const version = (data[0] & 0xF0) >> 4;
+
+        if (version === 4 && data.length >= 20) {
           const dstIp = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
           session.clients.forEach(({ ws: cws, tunIp }) => {
             if (cws.readyState === 1 && tunIp === dstIp) {
@@ -487,8 +509,10 @@ wss.on('connection', (ws, req) => {
             }
           });
         }
-        // Fallback: single-client session or dst IP didn't match any client —
-        // broadcast to all clients so nothing is dropped.
+
+        // For IPv6 frames or unmatched IPv4: broadcast to all clients.
+        // This covers IPv6 traffic from WhatsApp/TikTok which the client-side
+        // TUN will accept if the packet is destined for that client.
         if (!forwarded) {
           session.clients.forEach(({ ws: cws }) => {
             if (cws.readyState === 1) cws.send(data, { binary: true });
