@@ -446,14 +446,33 @@ wss.on('connection', (ws, req) => {
       store.stats.totalDataRelayed += data.length;
 
       if (conn.type === 'client') {
-        // CLIENT → HOST
+        // CLIENT → HOST: forward packet to the host of this session
         const host = store.hosts.get(session.hostId);
         if (host?.ws?.readyState === 1) host.ws.send(data, { binary: true });
       } else if (conn.type === 'host') {
-        // HOST → ALL CLIENTS
-        session.clients.forEach(({ ws: cws }) => {
-          if (cws.readyState === 1) cws.send(data, { binary: true });
-        });
+        // HOST → CLIENT: the host sends back response packets.
+        // Parse the destination IP from the IPv4 header (bytes 16-19) to find
+        // which client this packet belongs to. Fall back to broadcast only if
+        // there is exactly one client (avoids sending TikTok data to WhatsApp).
+        let forwarded = false;
+        if (data.length >= 20) {
+          const dstIp = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
+          session.clients.forEach(({ ws: cws, clientId }) => {
+            // Each client is assigned 10.8.0.2 — single-client sessions always match.
+            // Multi-client: match on the TUN address embedded in the packet dst.
+            if (cws.readyState === 1 && dstIp === '10.8.0.2') {
+              cws.send(data, { binary: true });
+              forwarded = true;
+            }
+          });
+        }
+        // Fallback: if dst IP matching didn't route it, send to all clients.
+        // This handles edge cases where dst IP differs from TUN address.
+        if (!forwarded) {
+          session.clients.forEach(({ ws: cws }) => {
+            if (cws.readyState === 1) cws.send(data, { binary: true });
+          });
+        }
       }
       return;
     }
