@@ -136,6 +136,8 @@ const store = {
   hosts: new Map(),
   sessions: new Map(),
   connections: new Map(),
+  // Track which TUN IPs are in use per session: sessionCode → Set<string>
+  sessionTunIps: new Map(),
   stats: {
     totalSessions: 0,
     totalDataRelayed: 0,
@@ -143,6 +145,28 @@ const store = {
     weeklyRevenuePool: 0,
   },
 };
+
+// ── TUN IP pool (10.8.0.2 – 10.8.0.254 per session) ──────────────────
+// Returns the next free /24 client address for a given session, or null if full.
+function assignTunIp(sessionCode) {
+  if (!store.sessionTunIps.has(sessionCode)) {
+    store.sessionTunIps.set(sessionCode, new Set());
+  }
+  const used = store.sessionTunIps.get(sessionCode);
+  for (let i = 2; i <= 254; i++) {
+    const ip = `10.8.0.${i}`;
+    if (!used.has(ip)) {
+      used.add(ip);
+      return ip;
+    }
+  }
+  return null; // pool exhausted
+}
+
+function releaseTunIp(sessionCode, ip) {
+  const used = store.sessionTunIps.get(sessionCode);
+  if (used) used.delete(ip);
+}
 
 // ── Middleware ────────────────────────────────────────────────────────
 app.use(cors({ origin: '*' }));
@@ -450,24 +474,21 @@ wss.on('connection', (ws, req) => {
         const host = store.hosts.get(session.hostId);
         if (host?.ws?.readyState === 1) host.ws.send(data, { binary: true });
       } else if (conn.type === 'host') {
-        // HOST → CLIENT: the host sends back response packets.
-        // Parse the destination IP from the IPv4 header (bytes 16-19) to find
-        // which client this packet belongs to. Fall back to broadcast only if
-        // there is exactly one client (avoids sending TikTok data to WhatsApp).
+        // HOST → CLIENT: route response packet to the correct client using the
+        // destination IP from the IPv4 header, which now matches each client's
+        // unique assigned TUN IP (10.8.0.2, 10.8.0.3, …).
         let forwarded = false;
         if (data.length >= 20) {
           const dstIp = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
-          session.clients.forEach(({ ws: cws, clientId }) => {
-            // Each client is assigned 10.8.0.2 — single-client sessions always match.
-            // Multi-client: match on the TUN address embedded in the packet dst.
-            if (cws.readyState === 1 && dstIp === '10.8.0.2') {
+          session.clients.forEach(({ ws: cws, tunIp }) => {
+            if (cws.readyState === 1 && tunIp === dstIp) {
               cws.send(data, { binary: true });
               forwarded = true;
             }
           });
         }
-        // Fallback: if dst IP matching didn't route it, send to all clients.
-        // This handles edge cases where dst IP differs from TUN address.
+        // Fallback: single-client session or dst IP didn't match any client —
+        // broadcast to all clients so nothing is dropped.
         if (!forwarded) {
           session.clients.forEach(({ ws: cws }) => {
             if (cws.readyState === 1) cws.send(data, { binary: true });
@@ -570,8 +591,16 @@ wss.on('connection', (ws, req) => {
         }
 
         const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        session.clients.add({ ws, clientId, accessCode: rawCode });
-        store.connections.set(ws, { type: 'client', id: clientId, sessionCode: targetSessionCode });
+
+        // Assign a unique TUN IP so every client gets its own /24 address.
+        // This lets the server route packets to the correct client by dst IP.
+        const tunIp = assignTunIp(targetSessionCode);
+        if (!tunIp) {
+          return send(ws, { type: 'JOIN_ERROR', reason: 'No TUN addresses available in this session.' });
+        }
+
+        session.clients.add({ ws, clientId, accessCode: rawCode, tunIp });
+        store.connections.set(ws, { type: 'client', id: clientId, sessionCode: targetSessionCode, tunIp });
 
         // Mark access code as used (only for admin-issued codes)
         if (accessCodeEntry && !accessCodeEntry.usedBy) {
@@ -579,8 +608,8 @@ wss.on('connection', (ws, req) => {
           await updateCodeInDB(accessCodeEntry.code, { usedBy: clientId });
         }
 
-        send(ws, { type: 'JOIN_SUCCESS', code: targetSessionCode, netType: host.netType, clientId });
-        send(host.ws, { type: 'CLIENT_CONNECTED', clientId, totalClients: session.clients.size });
+        send(ws, { type: 'JOIN_SUCCESS', code: targetSessionCode, netType: host.netType, clientId, tunIp });
+        send(host.ws, { type: 'CLIENT_CONNECTED', clientId, tunIp, totalClients: session.clients.size });
         console.log(`[relay] Client ${clientId} joined session ${targetSessionCode}`);
         break;
       }
@@ -617,6 +646,7 @@ wss.on('connection', (ws, req) => {
           session.clients.forEach(client => {
             if (client.ws === ws) session.clients.delete(client);
           });
+          if (conn.tunIp) releaseTunIp(conn.sessionCode, conn.tunIp);
           const host = store.hosts.get(session.hostId);
           if (host?.ws?.readyState === 1) {
             send(host.ws, { type: 'CLIENT_DISCONNECTED', clientId: conn.id, totalClients: session.clients.size });
@@ -660,6 +690,7 @@ wss.on('connection', (ws, req) => {
         session.clients.forEach(client => {
           if (client.ws === ws) session.clients.delete(client);
         });
+        if (conn.tunIp) releaseTunIp(conn.sessionCode, conn.tunIp);
         const host = store.hosts.get(session?.hostId);
         if (host?.ws?.readyState === 1) {
           send(host.ws, { type: 'CLIENT_DISCONNECTED', clientId: conn.id, totalClients: session.clients.size });
