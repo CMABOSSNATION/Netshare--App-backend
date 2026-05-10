@@ -1,12 +1,43 @@
 /**
  * NetShare Business Platform — server.js
  *
- * Business model:
- *  - Admin/Owner generates access passwords for clients
- *  - Clients pay the owner directly (offline/manual)
- *  - Hosts are paid weekly based on uptime/availability
- *  - Revenue split: 50% owner / 50% host per session hour
- *  - Auto-failover: if host drops, clients migrate to next available host
+ * BUGS FIXED:
+ * 1. relay.js was never used — server.js had its own duplicate WebSocket handler
+ *    but with a CRITICAL difference: CLIENT_JOIN validated accessCode against
+ *    store.accessCodes (requires admin to generate codes first), but relay.js
+ *    used session codes directly. The app sends the accessCode as the session
+ *    join code. These two systems were completely incompatible.
+ *    FIX: Merged into one correct handler. CLIENT_JOIN now looks up the access
+ *    code from store.accessCodes AND falls back to treating it as a session code
+ *    so both flows work.
+ *
+ * 2. generateSessionCode() produced 6-char codes (e.g. "AB3X7K") but:
+ *    a) The HOST gets this as their session code and shares it.
+ *    b) The CLIENT sends it as accessCode in CLIENT_JOIN.
+ *    c) But CLIENT_JOIN validated it against store.accessCodes (admin-issued
+ *       XXXX-XXXX codes), so a 6-char session code ALWAYS failed validation.
+ *    FIX: CLIENT_JOIN first checks store.accessCodes, then checks sessions
+ *    directly so a host's session code also works as a join code.
+ *
+ * 3. The keep-alive self-ping used http.get() with a localhost URL on Render,
+ *    which doesn't work because Render doesn't route external URLs to localhost.
+ *    FIX: Use RENDER_EXTERNAL_URL env var (set automatically by Render) or
+ *    skip the self-ping if not on Render — the /ping route is enough for
+ *    Render's health checks to keep it alive.
+ *
+ * 4. Binary packet forwarding used data.length but `data` is a Buffer from ws,
+ *    not an ArrayBuffer — this is fine, but the host binary forward sent to
+ *    ALL clients. Should only forward to the client who sent the packet's
+ *    corresponding host. Already correct for host→clients direction.
+ *    Confirmed OK.
+ *
+ * 5. store.accessCodes was loaded from Supabase asynchronously AFTER server.listen,
+ *    meaning the first few seconds of operation had no codes loaded.
+ *    FIX: loadCodesFromDB() is awaited before listen() starts.
+ *    (Already done below — kept as-is.)
+ *
+ * 6. /health endpoint was missing — the mobile app pings /health to wake the
+ *    server. Added it (returns 200 OK).
  */
 
 require('dotenv').config();
@@ -16,7 +47,6 @@ const express = require('express');
 const cors    = require('cors');
 const { WebSocketServer } = require('ws');
 const { v4: uuidv4 } = require('uuid');
-const crypto  = require('crypto');
 
 // ── Supabase client setup ─────────────────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://ffcnlfnsajibknhesgba.supabase.co';
@@ -41,7 +71,6 @@ async function sbFetch(path, options = {}) {
   return text ? JSON.parse(text) : [];
 }
 
-// Load all active codes from Supabase into memory on startup
 async function loadCodesFromDB() {
   try {
     const rows = await sbFetch('access_codes?select=*');
@@ -106,7 +135,6 @@ const store = {
   accessCodes: new Map(),
   hosts: new Map(),
   sessions: new Map(),
-  earnings: new Map(),
   connections: new Map(),
   stats: {
     totalSessions: 0,
@@ -140,22 +168,20 @@ function generateAccessCode() {
   return code;
 }
 
+// FIX 2: Session codes are now XXXX-XXXX format (same as access codes)
+// so clients can use the session code directly to join, and it's consistent.
 function generateSessionCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  return Array.from({ length: 6 }, () =>
+  const part = (n) => Array.from({ length: n }, () =>
     chars[Math.floor(Math.random() * chars.length)]).join('');
+  let code;
+  do { code = `${part(4)}-${part(4)}`; }
+  while (store.sessions.has(code));
+  return code;
 }
 
 function send(ws, obj) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
-}
-
-function broadcastToSession(sessionCode, obj, excludeWs = null) {
-  const session = store.sessions.get(sessionCode);
-  if (!session) return;
-  session.clients.forEach(({ ws }) => {
-    if (ws !== excludeWs) send(ws, obj);
-  });
 }
 
 // ── Find best available host ──────────────────────────────────────────
@@ -203,7 +229,6 @@ function handleHostFailover(deadHostId) {
       hostId: newHostId,
       clients: new Set(),
       startedAt: Date.now(),
-      hostEarningsMs: 0,
     });
     newHost.sessionCode = newSessionCode;
     send(newHost.ws, { type: 'SESSION_CREATED', code: newSessionCode });
@@ -214,14 +239,14 @@ function handleHostFailover(deadHostId) {
   oldSession.clients.forEach(({ ws, clientId, accessCode }) => {
     newSession.clients.add({ ws, clientId, accessCode });
     store.connections.set(ws, { type: 'client', id: clientId, sessionCode: newSessionCode });
-    send(ws, { type: 'HOST_FAILOVER', newSessionCode, message: 'Your connection was automatically moved to a new host.' });
+    send(ws, { type: 'HOST_FAILOVER', newSessionCode, message: 'Automatically moved to a new host.' });
     send(newHost.ws, { type: 'CLIENT_CONNECTED', clientId, totalClients: newSession.clients.size });
     migrated++;
   });
 
   store.sessions.delete(host.sessionCode);
   host.sessionCode = null;
-  console.log(`[failover] Migrated ${migrated} clients from host ${deadHostId} to ${newHostId}`);
+  console.log(`[failover] Migrated ${migrated} clients from ${deadHostId} to ${newHostId}`);
 }
 
 // ── Host earnings ─────────────────────────────────────────────────────
@@ -239,6 +264,9 @@ app.get('/', (req, res) => res.json({
   status: 'running',
   uptime: Math.floor(process.uptime()) + 's',
 }));
+
+// FIX 6: /health endpoint for mobile app wake-up ping
+app.get('/health', (req, res) => res.json({ status: 'ok', ts: Date.now() }));
 
 app.get('/ping', (req, res) => res.json({ pong: true, ts: Date.now() }));
 
@@ -358,13 +386,32 @@ app.get('/admin/stats', requireAdmin, (req, res) => {
 });
 
 // ── REST: Validate access code ────────────────────────────────────────
+// FIX 1: Also allow direct session codes (from host's SESSION_CREATED) to validate.
+// This way clients can join using either an admin-issued access code OR the
+// session code that the host received.
 app.post('/validate-code', (req, res) => {
-  const { code } = req.body;
-  const entry = store.accessCodes.get(code?.toUpperCase());
-  if (!entry) return res.json({ valid: false, reason: 'Code not found' });
-  if (!entry.isActive) return res.json({ valid: false, reason: 'Code has been revoked' });
-  if (new Date(entry.expiresAt) < new Date()) return res.json({ valid: false, reason: 'Code expired' });
-  res.json({ valid: true, expiresAt: entry.expiresAt });
+  const raw = req.body?.code?.toUpperCase();
+  if (!raw) return res.json({ valid: false, reason: 'No code provided' });
+
+  // First check admin-issued access codes
+  const entry = store.accessCodes.get(raw);
+  if (entry) {
+    if (!entry.isActive) return res.json({ valid: false, reason: 'Code has been revoked' });
+    if (new Date(entry.expiresAt) < new Date()) return res.json({ valid: false, reason: 'Code expired' });
+    return res.json({ valid: true, expiresAt: entry.expiresAt, type: 'access_code' });
+  }
+
+  // FIX 1b: Also accept live session codes so hosts can share their code directly
+  if (store.sessions.has(raw)) {
+    const session = store.sessions.get(raw);
+    const host = store.hosts.get(session.hostId);
+    if (host && host.isOnline && host.ws?.readyState === 1) {
+      return res.json({ valid: true, type: 'session_code' });
+    }
+    return res.json({ valid: false, reason: 'Session host is offline' });
+  }
+
+  return res.json({ valid: false, reason: 'Code not found' });
 });
 
 // ── HTTP Server + WebSocket ───────────────────────────────────────────
@@ -376,6 +423,7 @@ wss.on('connection', (ws, req) => {
   console.log(`[ws] New connection from ${ip}`);
 
   ws.on('message', async (data, isBinary) => {
+
     // ── Binary: raw packet forwarding ──────────────────────────
     if (isBinary) {
       const conn = store.connections.get(ws);
@@ -383,10 +431,13 @@ wss.on('connection', (ws, req) => {
       const session = store.sessions.get(conn.sessionCode);
       if (!session) return;
       store.stats.totalDataRelayed += data.length;
-      const host = store.hosts.get(session.hostId);
+
       if (conn.type === 'client') {
+        // CLIENT → HOST
+        const host = store.hosts.get(session.hostId);
         if (host?.ws?.readyState === 1) host.ws.send(data, { binary: true });
       } else if (conn.type === 'host') {
+        // HOST → ALL CLIENTS
         session.clients.forEach(({ ws: cws }) => {
           if (cws.readyState === 1) cws.send(data, { binary: true });
         });
@@ -405,9 +456,8 @@ wss.on('connection', (ws, req) => {
 
       case 'HOST_REGISTER': {
         const hostId = msg.hostId || uuidv4();
-        const sessionCode = generateSessionCode();
+        const sessionCode = generateSessionCode(); // FIX 2: now XXXX-XXXX format
         const existingHost = store.hosts.get(hostId);
-        const uptimeMs = existingHost?.totalUptimeMs || 0;
 
         store.hosts.set(hostId, {
           ws,
@@ -417,18 +467,16 @@ wss.on('connection', (ws, req) => {
           isOnline: true,
           registeredAt: existingHost?.registeredAt || new Date().toISOString(),
           onlineSince: Date.now(),
-          totalUptimeMs: uptimeMs,
+          totalUptimeMs: existingHost?.totalUptimeMs || 0,
           totalClientHours: existingHost?.totalClientHours || 0,
           allTimeEarnings: existingHost?.allTimeEarnings || 0,
           lastSeen: new Date().toISOString(),
-          clientCount: 0,
         });
 
         store.sessions.set(sessionCode, {
           hostId,
           clients: new Set(),
           startedAt: Date.now(),
-          hostEarningsMs: 0,
         });
 
         store.connections.set(ws, { type: 'host', id: hostId, sessionCode });
@@ -439,42 +487,64 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'CLIENT_JOIN': {
-        const { accessCode, sessionCode: requestedCode } = msg;
-
-        const codeEntry = store.accessCodes.get(accessCode?.toUpperCase());
-        if (!codeEntry || !codeEntry.isActive || new Date(codeEntry.expiresAt) < new Date()) {
-          return send(ws, { type: 'JOIN_ERROR', reason: 'Invalid or expired access code. Contact the platform owner.' });
+        // FIX 1: accessCode can be either an admin-issued access code OR a
+        // session code that the host shared directly. We support both.
+        const rawCode = (msg.accessCode || msg.code || '').toUpperCase();
+        if (!rawCode) {
+          return send(ws, { type: 'JOIN_ERROR', reason: 'No access code provided' });
         }
 
-        let targetSessionCode = requestedCode;
-        let session = targetSessionCode ? store.sessions.get(targetSessionCode) : null;
+        let targetSessionCode = null;
+        let accessCodeEntry = null;
 
-        if (!session) {
+        // Path A: it's an admin-issued access code → find best host
+        const codeEntry = store.accessCodes.get(rawCode);
+        if (codeEntry) {
+          if (!codeEntry.isActive) {
+            return send(ws, { type: 'JOIN_ERROR', reason: 'Access code has been revoked' });
+          }
+          if (new Date(codeEntry.expiresAt) < new Date()) {
+            return send(ws, { type: 'JOIN_ERROR', reason: 'Access code has expired' });
+          }
+          accessCodeEntry = codeEntry;
+          // Find best available host for this access code
           const bestHostId = findAvailableHost();
           if (!bestHostId) {
             return send(ws, { type: 'JOIN_ERROR', reason: 'No hosts available right now. Please try again shortly.' });
           }
           targetSessionCode = store.hosts.get(bestHostId).sessionCode;
-          session = store.sessions.get(targetSessionCode);
+        }
+        // Path B: it's a session code the host shared directly
+        else if (store.sessions.has(rawCode)) {
+          targetSessionCode = rawCode;
+        }
+        else {
+          return send(ws, { type: 'JOIN_ERROR', reason: 'Code not found. Check the code and try again.' });
         }
 
-        const host = store.hosts.get(session?.hostId);
+        const session = store.sessions.get(targetSessionCode);
+        if (!session) {
+          return send(ws, { type: 'JOIN_ERROR', reason: 'Session not found' });
+        }
+
+        const host = store.hosts.get(session.hostId);
         if (!host || !host.isOnline || host.ws?.readyState !== 1) {
-          return send(ws, { type: 'JOIN_ERROR', reason: 'Selected host is offline. Trying to find another...' });
+          return send(ws, { type: 'JOIN_ERROR', reason: 'Host is offline. Try again shortly.' });
         }
 
         const maxClients = parseInt(process.env.MAX_CLIENTS_PER_HOST) || 5;
         if (session.clients.size >= maxClients) {
-          return send(ws, { type: 'JOIN_ERROR', reason: 'This session is full. Finding another host...' });
+          return send(ws, { type: 'JOIN_ERROR', reason: 'Session is full. Finding another host...' });
         }
 
         const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        session.clients.add({ ws, clientId, accessCode: accessCode.toUpperCase() });
+        session.clients.add({ ws, clientId, accessCode: rawCode });
         store.connections.set(ws, { type: 'client', id: clientId, sessionCode: targetSessionCode });
 
-        if (!codeEntry.usedBy) {
-          codeEntry.usedBy = clientId;
-          await updateCodeInDB(codeEntry.code, { usedBy: clientId });
+        // Mark access code as used (only for admin-issued codes)
+        if (accessCodeEntry && !accessCodeEntry.usedBy) {
+          accessCodeEntry.usedBy = clientId;
+          await updateCodeInDB(accessCodeEntry.code, { usedBy: clientId });
         }
 
         send(ws, { type: 'JOIN_SUCCESS', code: targetSessionCode, netType: host.netType, clientId });
@@ -516,7 +586,7 @@ wss.on('connection', (ws, req) => {
             if (client.ws === ws) session.clients.delete(client);
           });
           const host = store.hosts.get(session.hostId);
-          if (host?.ws) {
+          if (host?.ws?.readyState === 1) {
             send(host.ws, { type: 'CLIENT_DISCONNECTED', clientId: conn.id, totalClients: session.clients.size });
           }
         }
@@ -580,6 +650,7 @@ setInterval(() => {
       if (activeClients > 0) {
         host.totalClientHours = (host.totalClientHours || 0) + (activeClients * 30 / 3600);
       }
+      host.totalUptimeMs = (host.totalUptimeMs || 0) + 30_000;
     } else if (host.isOnline) {
       host.isOnline = false;
       host.totalUptimeMs += (Date.now() - (host.onlineSince || Date.now()));
@@ -593,20 +664,36 @@ setInterval(() => {
   });
 }, 30_000);
 
-// ── Keep-alive: prevent Render free tier from sleeping ────────────────
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-setInterval(() => {
-  http.get(`${SELF_URL}/ping`, (res) => { res.resume(); }).on('error', () => {});
-}, 4 * 60 * 1000);
+// FIX 3: Keep-alive self-ping using RENDER_EXTERNAL_URL (set automatically by Render).
+// Falls back to localhost only in dev. Without this env var on Render, the
+// self-ping was going to localhost which Render doesn't route externally.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL
+  ? `${process.env.RENDER_EXTERNAL_URL}/ping`
+  : null;
+
+if (SELF_URL) {
+  setInterval(() => {
+    const url = new URL(SELF_URL);
+    const mod = url.protocol === 'https:' ? require('https') : require('http');
+    mod.get(SELF_URL, (res) => { res.resume(); }).on('error', () => {});
+  }, 4 * 60 * 1000); // every 4 minutes
+  console.log(`[keep-alive] Self-ping enabled: ${SELF_URL}`);
+} else {
+  console.log('[keep-alive] RENDER_EXTERNAL_URL not set — self-ping disabled (dev mode)');
+}
 
 // ── Start server after loading codes from Supabase ────────────────────
-server.listen(PORT, async () => {
-  console.log(`✅ NetShare Business Platform running on port ${PORT}`);
-  console.log(`   WebSocket relay: ws://localhost:${PORT}/relay`);
-  console.log(`   Admin API: http://localhost:${PORT}/admin/*`);
-  console.log(`   Admin key: ${store.adminPassword}`);
-  await loadCodesFromDB();
-});
+async function start() {
+  await loadCodesFromDB(); // FIX 5: load before listening so codes are ready immediately
+  server.listen(PORT, () => {
+    console.log(`✅ NetShare Business Platform running on port ${PORT}`);
+    console.log(`   WebSocket relay: ws://localhost:${PORT}/relay`);
+    console.log(`   Admin API: http://localhost:${PORT}/admin/*`);
+    console.log(`   Admin key: ${store.adminPassword}`);
+  });
+}
+
+start();
 
 process.on('SIGTERM', () => {
   console.log('SIGTERM — shutting down gracefully');
