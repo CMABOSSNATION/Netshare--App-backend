@@ -415,8 +415,21 @@ app.post('/validate-code', (req, res) => {
 });
 
 // ── HTTP Server + WebSocket ───────────────────────────────────────────
+// FIX: Do NOT pass `server` to WebSocketServer — that lets Express intercept
+// the WS upgrade request and return 400. Instead, handle the 'upgrade' event
+// directly on the HTTP server so the handshake bypasses Express entirely.
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/relay' });
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  if (req.url === '/relay') {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
 
 wss.on('connection', (ws, req) => {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
