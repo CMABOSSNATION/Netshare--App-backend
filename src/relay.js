@@ -2,10 +2,16 @@
  * relay.js — NetShare Relay Server (Updated for Native VPN)
  *
  * Session flow:
- *  1. HOST connects → server assigns 6-char code → HOST gets SESSION_CREATED
+ *  1. HOST connects → server assigns code → HOST gets SESSION_CREATED
  *  2. CLIENT connects with code → server pairs them → both get JOIN_SUCCESS
  *  3. Binary packets flow: CLIENT TUN → relay → HOST network stack
  *  4. Either side disconnects → other side is notified
+ *
+ * BUGS FIXED:
+ * 1. generateCode() produced 6-char codes but app expects XXXX-XXXX (8 chars + dash).
+ *    Fixed: generate XXXX-XXXX format.
+ * 2. CLIENT_JOIN handler read msg.code but app sends msg.accessCode.
+ *    Fixed: read msg.accessCode (with msg.code fallback for compatibility).
  */
 
 const WebSocket = require('ws');
@@ -21,12 +27,18 @@ const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const SESSION_TIMEOUT_MS = parseInt(process.env.SESSION_TIMEOUT_MS) || 3_600_000;
 const MAX_CLIENTS = parseInt(process.env.MAX_CLIENTS_PER_HOST) || 5;
 
+// FIX 1: Generate XXXX-XXXX format to match the app's access code input.
+// The app validates length >= 8 and formats input as XXXX-XXXX.
 function generateCode() {
   let code;
   do {
-    code = Array.from({ length: 6 }, () =>
+    const part1 = Array.from({ length: 4 }, () =>
       CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]
     ).join('');
+    const part2 = Array.from({ length: 4 }, () =>
+      CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]
+    ).join('');
+    code = `${part1}-${part2}`;
   } while (sessions.has(code));
   return code;
 }
@@ -90,8 +102,7 @@ function setupRelay(wss) {
             session.host.send(data, { binary: true });
           }
         } else if (conn.role === 'host') {
-          // HOST → CLIENT: forward response back to originating client
-          // For simplicity, broadcast to all clients (real impl would track per-client)
+          // HOST → CLIENT: forward response back to all clients
           session.clients.forEach(clientWs => {
             if (clientWs.readyState === WebSocket.OPEN) {
               clientWs.send(data, { binary: true });
@@ -114,7 +125,6 @@ function setupRelay(wss) {
       switch (msg.type) {
 
         case 'HOST_REGISTER': {
-          // Generate session code and register host
           const code = generateCode();
           sessions.set(code, {
             host: ws,
@@ -130,7 +140,8 @@ function setupRelay(wss) {
         }
 
         case 'CLIENT_JOIN': {
-          const { code } = msg;
+          // FIX 2: App sends accessCode, not code. Support both for compatibility.
+          const code = msg.accessCode || msg.code;
           if (!code) return send(ws, { type: 'JOIN_ERROR', reason: 'No code provided' });
 
           const session = sessions.get(code);
@@ -153,7 +164,6 @@ function setupRelay(wss) {
         }
 
         case 'PONG': {
-          // Heartbeat response — no action needed
           break;
         }
 
@@ -214,13 +224,10 @@ function setupRelay(wss) {
   console.log('[relay] Relay handler attached to WebSocket server');
 }
 
-
-
 function getStats() {
   const stats = { activeSessions: sessions.size, totalClients: 0 };
   sessions.forEach(s => { stats.totalClients += s.clients.size; });
   return stats;
 }
 
-// Re-export with getStats added
 module.exports = { setupRelay, getStats };
