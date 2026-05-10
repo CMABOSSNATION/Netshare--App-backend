@@ -433,14 +433,10 @@ app.post('/validate-code', (req, res) => {
     return res.json({ valid: true, expiresAt: entry.expiresAt, type: 'access_code' });
   }
 
-  // FIX 1b: Also accept live session codes so hosts can share their code directly
+  // Session codes are NOT valid for client join — only admin-issued codes are.
+  // Reject session codes clearly so the client shows the right error message.
   if (store.sessions.has(raw)) {
-    const session = store.sessions.get(raw);
-    const host = store.hosts.get(session.hostId);
-    if (host && host.isOnline && host.ws?.readyState === 1) {
-      return res.json({ valid: true, type: 'session_code' });
-    }
-    return res.json({ valid: false, reason: 'Session host is offline' });
+    return res.json({ valid: false, reason: 'Please use an admin-issued access code.' });
   }
 
   return res.json({ valid: false, reason: 'Code not found' });
@@ -455,7 +451,9 @@ const server = http.createServer(app);
 // Default ws maxPayload is 100MB which is fine, but set explicitly here
 // to document the intent and allow tuning. 128KB covers the largest
 // QUIC/RTP frames while staying well within memory bounds per connection.
-const wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024 });
+// maxPayload 256KB: WhatsApp media frames + QUIC bursts fit within this.
+// 128KB was too small and caused silent frame drops for large image transfers.
+const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
 
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/relay') {
@@ -591,9 +589,12 @@ wss.on('connection', (ws, req) => {
           }
           targetSessionCode = store.hosts.get(bestHostId).sessionCode;
         }
-        // Path B: it's a session code the host shared directly
+        // Path B: it's a session code the host shared directly.
+        // NOTE: Direct session code joins are disabled — only admin-issued
+        // access codes are accepted. This ensures the admin controls all
+        // access. If a session code is submitted, reject it clearly.
         else if (store.sessions.has(rawCode)) {
-          targetSessionCode = rawCode;
+          return send(ws, { type: 'JOIN_ERROR', reason: 'Please use an admin-issued access code to join.' });
         }
         else {
           return send(ws, { type: 'JOIN_ERROR', reason: 'Code not found. Check the code and try again.' });
