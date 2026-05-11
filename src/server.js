@@ -592,12 +592,11 @@ wss.on('connection', (ws, req) => {
           const targetWs = tunMap?.get(dstIp);
           if (targetWs?.readyState === 1) {
             targetWs.send(data, { binary: true, compress: false });
-          } else {
-            // Unmatched IPv4 dst (e.g. broadcast/multicast): fall back to forEach.
-            session.clients.forEach(({ ws: cws }) => {
-              if (cws.readyState === 1) cws.send(data, { binary: true, compress: false });
-            });
           }
+          // FIX-SPEED-5: Unmatched dst = multicast (224.x.x.x) or broadcast (255.x.x.x).
+          // DROP silently instead of broadcasting to all clients.
+          // The old forEach broadcast flooded every client with mDNS/SSDP/IGMP noise,
+          // wasting bandwidth and causing TikTok to detect fake "congestion" and throttle video.
         } else if (version === 6 && data.length >= 40) {
           // FIX-N1 (IPv6): O(1) lookup by 32-char hex dst address (bytes 24-39).
           // Previously this did a forEach broadcast to ALL clients, flooding
