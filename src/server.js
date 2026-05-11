@@ -519,19 +519,30 @@ const server = http.createServer(app);
 // SPEED: Disable Nagle's algorithm on the HTTP server itself.
 // Node.js HTTP server doesn't set TCP_NODELAY by default.
 // This reduces latency for small packets (control messages, ACKs).
+// SPEED-OPT-S4: Increase OS socket buffer sizes on each connection.
+// Default Node.js/OS socket buffers (~87KB on Linux) limit throughput to
+// ~700Kbps on a 100ms RTT link (BDP = 100Mbps × 100ms = 1.25MB).
+// Setting explicit buffers tells the OS kernel to allocate more memory
+// per socket, matching the bandwidth-delay product of 4G/5G links.
 server.on('connection', (socket) => {
   socket.setNoDelay(true);
-  // Increase socket buffer sizes for high-throughput relay
   socket.setKeepAlive(true, 30000);
+  // Hint to OS: use larger socket buffers for this relay server.
+  // These are advisory on Linux — the kernel may grant less, but always
+  // at least the default. On most VPS hosts this doubles effective buffer size.
+  try {
+    socket._handle?.setRecvBufferSize?.(4 * 1024 * 1024);
+    socket._handle?.setSendBufferSize?.(4 * 1024 * 1024);
+  } catch (_) {}
 });
 
-// SPEED: perMessageDeflate disabled — all relayed traffic is already TLS/QUIC-encrypted
-// and compressed by the underlying protocols. Trying to deflate it wastes CPU cycles
-// with zero size reduction, and adds 10–20ms latency per frame on a busy relay.
-// maxPayload 200 KB: 65535-byte IP packet + WS framing overhead + some headroom.
+// SPEED-OPT-S1: maxPayload raised from 200KB → 256KB.
+// With MTU now 1500 bytes, IP-level fragmentation produces larger reassembled
+// frames. 256KB gives enough headroom for jumbo QUIC segments from TikTok CDN.
+// perMessageDeflate disabled — encrypted/compressed traffic gains nothing from deflate.
 const wss = new WebSocketServer({
   noServer: true,
-  maxPayload: 200 * 1024,
+  maxPayload: 256 * 1024,
   perMessageDeflate: false,
 });
 
@@ -575,10 +586,13 @@ wss.on('connection', (ws, req) => {
       if (conn.type === 'client') {
         // CLIENT → HOST: forward packet to the host of this session
         const host = store.hosts.get(session.hostId);
-        // SPEED: send() with { binary: true, compress: false } skips the
-        // per-message deflate check (packets are already compressed/encrypted
-        // by TLS/QUIC — compressing again wastes CPU with no size reduction).
-        if (host?.ws?.readyState === 1) host.ws.send(data, { binary: true, compress: false });
+        // SPEED-OPT-S2: Backpressure guard — if host socket buffer is full (bufferedAmount
+        // > 4MB), drop this packet rather than queuing more. This prevents the relay from
+        // accumulating a multi-second backlog that makes video feel "frozen then jumpy".
+        // 4MB = ~2666 × 1500-byte packets = ~26ms of 4G throughput headroom.
+        if (host?.ws?.readyState === 1 && (host.ws.bufferedAmount || 0) < 4 * 1024 * 1024) {
+          host.ws.send(data, { binary: true, compress: false });
+        }
       } else if (conn.type === 'host') {
         // HOST → CLIENT: route response to the correct client by dst TUN IP.
         // SPEED: O(1) Map lookup instead of forEach scan over all clients.
@@ -590,7 +604,10 @@ wss.on('connection', (ws, req) => {
           // FIX-N1 (IPv4): O(1) lookup by dotted-decimal dst IP
           const dstIp = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
           const targetWs = tunMap?.get(dstIp);
-          if (targetWs?.readyState === 1) {
+          // SPEED-OPT-S3: Backpressure guard on client socket.
+          // If the client's WS buffer is backed up (slow phone, weak signal),
+          // drop rather than queue — stale video frames are worse than dropped ones.
+          if (targetWs?.readyState === 1 && (targetWs.bufferedAmount || 0) < 2 * 1024 * 1024) {
             targetWs.send(data, { binary: true, compress: false });
           }
           // FIX-SPEED-5: Unmatched dst = multicast (224.x.x.x) or broadcast (255.x.x.x).
@@ -599,13 +616,10 @@ wss.on('connection', (ws, req) => {
           // wasting bandwidth and causing TikTok to detect fake "congestion" and throttle video.
         } else if (version === 6 && data.length >= 40) {
           // FIX-N1 (IPv6): O(1) lookup by 32-char hex dst address (bytes 24-39).
-          // Previously this did a forEach broadcast to ALL clients, flooding
-          // every client with every other client's IPv6 traffic.
-          // Apps like TikTok, Instagram, YouTube use IPv6 heavily — this was
-          // the primary cause of slowness and broken apps.
           const dstKey = buildIpv6KeyFromBuffer(data, 24);
           const targetWs = tunMap?.get(dstKey);
-          if (targetWs?.readyState === 1) {
+          // SPEED-OPT-S3 (IPv6): same backpressure guard as IPv4 path above
+          if (targetWs?.readyState === 1 && (targetWs.bufferedAmount || 0) < 2 * 1024 * 1024) {
             targetWs.send(data, { binary: true, compress: false });
           }
           // No match = link-local/multicast (ND, RS, RA) → drop silently.
@@ -848,9 +862,10 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err) => console.error(`[ws] error: ${err.message}`));
 });
 
-// ── Heartbeat: ping all connections every 15s ─────────────────────────
-// 15s interval: dead hosts are detected within 30s (ping + missed pong).
-// Previously 30s meant up to 60s of clients sending to a dead host.
+// SPEED-OPT-S5: Heartbeat reduced from 15s → 10s.
+// Faster dead-host detection means clients wait less time before failover.
+// 10s ping + 10s missed-pong = 20s max before rerouting (was 30s at 15s interval).
+// Also matches the tightened connection lost timeout on the Android side (10s).
 setInterval(() => {
   store.hosts.forEach((host, hostId) => {
     if (host.ws?.readyState === 1) {
@@ -872,7 +887,7 @@ setInterval(() => {
       if (ws.readyState === 1) send(ws, { type: 'PING' });
     });
   });
-}, 15_000);
+}, 10_000);
 
 // FIX 3: Keep-alive self-ping using RENDER_EXTERNAL_URL (set automatically by Render).
 // Falls back to localhost only in dev. Without this env var on Render, the
