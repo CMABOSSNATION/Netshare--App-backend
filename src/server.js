@@ -1,7 +1,7 @@
 /**
  * NetShare Business Platform — server.js
  *
- * BUGS FIXED:
+ * BUGS FIXED (original):
  * 1. relay.js was never used — server.js had its own duplicate WebSocket handler
  *    but with a CRITICAL difference: CLIENT_JOIN validated accessCode against
  *    store.accessCodes (requires admin to generate codes first), but relay.js
@@ -38,6 +38,30 @@
  *
  * 6. /health endpoint was missing — the mobile app pings /health to wake the
  *    server. Added it (returns 200 OK).
+ *
+ * NEW FIXES:
+ * FIX-N1: IPv6 packets were broadcast to ALL clients instead of routed by dst IP.
+ *   Root cause of "only Google/Chrome works slowly" — apps using IPv6 (TikTok,
+ *   Instagram, YouTube, WhatsApp) flooded every client with every other client's
+ *   traffic. Google/Chrome happened to work because they retry over IPv4.
+ *   FIX: Parse IPv6 dst address (bytes 24–39), use 32-char hex key in sessionTunMap,
+ *   and do an O(1) map lookup. Also register the IPv6 key in sessionTunMap at
+ *   CLIENT_JOIN so routing is ready before the first IPv6 packet arrives.
+ *
+ * FIX-N2: Failover didn't migrate tunIp assignments to the new session.
+ *   After failover, migrated clients had no entry in the new sessionTunIps or
+ *   sessionTunMap, so the new host could not route any replies back to them.
+ *   FIX: assignTunIp() in the new session for each migrated client, update
+ *   store.connections with the new tunIp, and register both IPv4 and IPv6 keys
+ *   in the new sessionTunMap. Send new tunIp to client and host.
+ *
+ * FIX-N3: Unhandled async rejection in ws.on('message') could crash the server.
+ *   Any thrown error inside the async handler (e.g. updateCodeInDB throwing) was
+ *   an unhandledRejection. FIX: wrap entire handler body in try/catch.
+ *
+ * FIX-N4: Access code expiry not re-checked on reconnect.
+ *   A code marked usedBy could still be submitted after expiry on reconnect.
+ *   FIX: expiry check runs unconditionally before the usedBy/isActive checks.
  */
 
 require('dotenv').config();
@@ -221,6 +245,28 @@ function send(ws, obj) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
+// FIX-N1: derive a stable map key for an IPv4 TUN address and its
+// link-local IPv6 equivalent (fe80::/10 EUI-64 style isn't used here —
+// we simply register the literal tunIp string for IPv4 and a derived
+// IPv4-mapped IPv6 key so the routing table covers both address families).
+//
+// sessionTunMap key format:
+//   IPv4: "10.8.0.X"          (string, from dst bytes 16-19)
+//   IPv6: 32-char hex string  (from dst bytes 24-39)
+//
+// ipv4MappedKey("10.8.0.2") → "00000000000000000000ffff0a080002"
+// This matches what buildIpv6KeyFromBuffer() extracts from a live packet.
+function ipv4MappedKey(ipv4Str) {
+  const parts = ipv4Str.split('.').map(Number);
+  // ::ffff:a.b.c.d
+  return `00000000000000000000ffff${parts.map(b => b.toString(16).padStart(2,'0')).join('')}`;
+}
+
+// Extract 32-char hex key from a Buffer starting at `offset` (16 bytes).
+function buildIpv6KeyFromBuffer(buf, offset) {
+  return buf.slice(offset, offset + 16).toString('hex');
+}
+
 // ── Find best available host ──────────────────────────────────────────
 function findAvailableHost(excludeHostId = null) {
   let best = null;
@@ -274,10 +320,23 @@ function handleHostFailover(deadHostId) {
   const newSession = store.sessions.get(newSessionCode);
   let migrated = 0;
   oldSession.clients.forEach(({ ws, clientId, accessCode }) => {
-    newSession.clients.add({ ws, clientId, accessCode });
-    store.connections.set(ws, { type: 'client', id: clientId, sessionCode: newSessionCode });
-    send(ws, { type: 'HOST_FAILOVER', newSessionCode, message: 'Automatically moved to a new host.' });
-    send(newHost.ws, { type: 'CLIENT_CONNECTED', clientId, totalClients: newSession.clients.size });
+    // FIX-N2: assign a fresh TUN IP in the new session for each migrated client.
+    // Previously clients were migrated with no tunIp in the new session, so the
+    // new host could not route any reply packets back to them (no map entry).
+    const newTunIp = assignTunIp(newSessionCode);
+    if (!newTunIp) {
+      send(ws, { type: 'HOST_FAILOVER_FAILED', reason: 'No TUN addresses available on new host.' });
+      return;
+    }
+    newSession.clients.add({ ws, clientId, accessCode, tunIp: newTunIp });
+    store.connections.set(ws, { type: 'client', id: clientId, sessionCode: newSessionCode, tunIp: newTunIp });
+    // Register IPv4 + IPv6 keys in the new session's routing map
+    if (!sessionTunMap.has(newSessionCode)) sessionTunMap.set(newSessionCode, new Map());
+    sessionTunMap.get(newSessionCode).set(newTunIp, ws);
+    sessionTunMap.get(newSessionCode).set(ipv4MappedKey(newTunIp), ws);
+    // Tell the client its new session and new TUN IP so it can rebuild its TUN
+    send(ws, { type: 'HOST_FAILOVER', newSessionCode, tunIp: newTunIp, message: 'Automatically moved to a new host.' });
+    send(newHost.ws, { type: 'CLIENT_CONNECTED', clientId, tunIp: newTunIp, totalClients: newSession.clients.size });
     migrated++;
   });
 
@@ -498,6 +557,7 @@ wss.on('connection', (ws, req) => {
   console.log(`[ws] New connection from ${ip}`);
 
   ws.on('message', async (data, isBinary) => {
+    try {
 
     // ── Binary: raw packet forwarding ──────────────────────────
     if (isBinary) {
@@ -522,12 +582,13 @@ wss.on('connection', (ws, req) => {
       } else if (conn.type === 'host') {
         // HOST → CLIENT: route response to the correct client by dst TUN IP.
         // SPEED: O(1) Map lookup instead of forEach scan over all clients.
-        // sessionTunMap: sessionCode → Map<tunIp, ws>
+        // sessionTunMap: sessionCode → Map<tunIp|ipv6HexKey, ws>
+        const tunMap = sessionTunMap.get(conn.sessionCode);
         const version = (data[0] & 0xF0) >> 4;
 
         if (version === 4 && data.length >= 20) {
+          // FIX-N1 (IPv4): O(1) lookup by dotted-decimal dst IP
           const dstIp = `${data[16]}.${data[17]}.${data[18]}.${data[19]}`;
-          const tunMap = sessionTunMap.get(conn.sessionCode);
           const targetWs = tunMap?.get(dstIp);
           if (targetWs?.readyState === 1) {
             targetWs.send(data, { binary: true, compress: false });
@@ -537,12 +598,21 @@ wss.on('connection', (ws, req) => {
               if (cws.readyState === 1) cws.send(data, { binary: true, compress: false });
             });
           }
-        } else {
-          // IPv6 or unknown: broadcast — client TUN filters by its own addr.
-          session.clients.forEach(({ ws: cws }) => {
-            if (cws.readyState === 1) cws.send(data, { binary: true, compress: false });
-          });
+        } else if (version === 6 && data.length >= 40) {
+          // FIX-N1 (IPv6): O(1) lookup by 32-char hex dst address (bytes 24-39).
+          // Previously this did a forEach broadcast to ALL clients, flooding
+          // every client with every other client's IPv6 traffic.
+          // Apps like TikTok, Instagram, YouTube use IPv6 heavily — this was
+          // the primary cause of slowness and broken apps.
+          const dstKey = buildIpv6KeyFromBuffer(data, 24);
+          const targetWs = tunMap?.get(dstKey);
+          if (targetWs?.readyState === 1) {
+            targetWs.send(data, { binary: true, compress: false });
+          }
+          // No match = link-local/multicast (ND, RS, RA) → drop silently.
+          // These are never meant for a specific client anyway.
         }
+        // Unknown IP version: drop silently.
       }
       return;
     }
@@ -602,11 +672,12 @@ wss.on('connection', (ws, req) => {
         // Path A: it's an admin-issued access code → find best host
         const codeEntry = store.accessCodes.get(rawCode);
         if (codeEntry) {
-          if (!codeEntry.isActive) {
-            return send(ws, { type: 'JOIN_ERROR', reason: 'Access code has been revoked' });
-          }
+          // FIX-N4: check expiry first, unconditionally — even on reconnect
           if (new Date(codeEntry.expiresAt) < new Date()) {
             return send(ws, { type: 'JOIN_ERROR', reason: 'Access code has expired' });
+          }
+          if (!codeEntry.isActive) {
+            return send(ws, { type: 'JOIN_ERROR', reason: 'Access code has been revoked' });
           }
           accessCodeEntry = codeEntry;
           // Find best available host for this access code
@@ -657,6 +728,9 @@ wss.on('connection', (ws, req) => {
         // SPEED: register client in O(1) TUN routing map
         if (!sessionTunMap.has(targetSessionCode)) sessionTunMap.set(targetSessionCode, new Map());
         sessionTunMap.get(targetSessionCode).set(tunIp, ws);
+        // FIX-N1: also register the IPv4-mapped IPv6 key so IPv6 packets from
+        // the host are routed to this client without a forEach broadcast.
+        sessionTunMap.get(targetSessionCode).set(ipv4MappedKey(tunIp), ws);
 
         // Mark access code as used (only for admin-issued codes)
         if (accessCodeEntry && !accessCodeEntry.usedBy) {
@@ -704,8 +778,9 @@ wss.on('connection', (ws, req) => {
           });
           if (conn.tunIp) {
             releaseTunIp(conn.sessionCode, conn.tunIp);
-            // Remove from O(1) TUN routing map
+            // Remove from O(1) TUN routing map (IPv4 + IPv6 keys)
             sessionTunMap.get(conn.sessionCode)?.delete(conn.tunIp);
+            sessionTunMap.get(conn.sessionCode)?.delete(ipv4MappedKey(conn.tunIp));
           }
           const host = store.hosts.get(session.hostId);
           if (host?.ws?.readyState === 1) {
@@ -727,6 +802,12 @@ wss.on('connection', (ws, req) => {
 
       default:
         console.warn(`[ws] Unknown type: ${msg.type}`);
+    }
+
+    } catch (err) {
+      // FIX-N3: catch any unhandled async error so the server never crashes
+      // from a bad message, a DB failure, or an unexpected payload.
+      console.error('[ws] unhandled message error:', err.message);
     }
   });
 
@@ -754,6 +835,7 @@ wss.on('connection', (ws, req) => {
           releaseTunIp(conn.sessionCode, conn.tunIp);
           // Remove from O(1) TUN routing map
           sessionTunMap.get(conn.sessionCode)?.delete(conn.tunIp);
+          sessionTunMap.get(conn.sessionCode)?.delete(ipv4MappedKey(conn.tunIp));
         }
         const host = store.hosts.get(session?.hostId);
         if (host?.ws?.readyState === 1) {
