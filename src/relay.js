@@ -1,423 +1,325 @@
 /**
- * relay.js — NetShare Relay Server (QUIC + Cloudflare Edition)
+ * relay.js — Cloudflare Durable Object
  *
- * TRANSPORT UPGRADE:
+ * Replaces the Node.js ws + Express relay.
+ * All session state lives inside this single Durable Object
+ * so every Worker instance shares the same in-memory store.
  *
- * This server is now designed to run behind a Cloudflare Tunnel (cloudflared),
- * which provides:
- *   - HTTP/3 (QUIC) between clients/phones and Cloudflare's edge
- *   - Cloudflare Argo Smart Routing over the WAN (optimal path for 100km links)
- *   - Zero cold-starts (no Render free-tier 30s spin-up delay)
- *   - Always-on TLS via Cloudflare's certificates — no cert management needed
- *   - Connection migration: if the mobile device changes from WiFi → 4G, the
- *     QUIC connection migrates without dropping (critical for host devices
- *     moving between networks)
+ * Preserved from original:
+ *  - QUIC-1  CF header parsing (CF-Connecting-IP, CF-Ray, CF-Visitor)
+ *  - QUIC-3  15s heartbeat
+ *  - QUIC-4  HOST_RECONNECT / connection-migration
+ *  - QUIC-5  512-byte small-frame threshold
+ *  - RELAY-PERF-4  back-pressure guard (bufferedAmount)
+ *  - All message types: HOST_REGISTER, CLIENT_JOIN, HOST_RECONNECT,
+ *    PONG, HOST_LEAVE, CLIENT_LEAVE
  *
- * HOW IT WORKS:
- *   The relay process itself still speaks WebSocket over HTTP/1.1 on localhost.
- *   Cloudflare Tunnel (cloudflared) terminates QUIC/HTTP3 at the edge and
- *   proxies it to this localhost WebSocket server over a secure tunnel.
- *   From the phone's perspective, it connects to your Cloudflare tunnel URL
- *   (e.g. wss://netshare.yourdomain.workers.dev) over QUIC — the relay sees
- *   a normal WebSocket connection.
- *
- * DEPLOYMENT:
- *   1. Install cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
- *   2. Authenticate: cloudflared tunnel login
- *   3. Create tunnel: cloudflared tunnel create netshare-relay
- *   4. Create config (~/.cloudflared/config.yml):
- *        tunnel: <TUNNEL_ID>
- *        credentials-file: ~/.cloudflared/<TUNNEL_ID>.json
- *        ingress:
- *          - hostname: relay.yourdomain.com
- *            service: http://localhost:3000
- *            originRequest:
- *              connectTimeout: 10s
- *              noTLSVerify: false
- *              http2Origin: true        # ← enables HTTP/2 to origin
- *              proxyType: ""
- *          - service: http_status:404
- *   5. Route DNS: cloudflared tunnel route dns netshare-relay relay.yourdomain.com
- *   6. Run: cloudflared tunnel run netshare-relay
- *   7. Update RELAY_URL in VpnService.js to: wss://relay.yourdomain.com/relay
- *
- * QUIC-SPECIFIC CHANGES IN THIS FILE:
- *
- * QUIC-1: Cloudflare CF-* header parsing
- *   Cloudflare forwards request metadata in CF-* headers. We use CF-Connecting-IP
- *   for accurate client IP logging (instead of the tunnel's loopback IP), and
- *   CF-Ray for request tracing. We also detect CF-Visitor to know if the edge
- *   connection was HTTP/3 (QUIC) or HTTP/2 — logged for diagnostics.
- *
- * QUIC-2: Stream multiplexing awareness
- *   QUIC eliminates Head-of-Line blocking at the transport layer (each stream
- *   is independent). However, Node.js WebSocket still serialises on a single
- *   TCP/QUIC stream per connection. We preserve the fair-queue logic from
- *   RELAY-PERF-2 because it still helps on the HOST→CLIENT local WiFi segment
- *   (which is still TCP/WebSocket, not QUIC).
- *
- * QUIC-3: Reduced heartbeat to 15s
- *   Cloudflare Tunnel keepalives its own connection to the edge. Our heartbeat
- *   only needs to keep the edge→phone QUIC stream alive. QUIC idle timeout on
- *   Cloudflare is 30s; we send every 15s for safety. This replaces the 20s value.
- *
- * QUIC-4: Connection migration support (server side)
- *   When a QUIC client migrates (IP change), Cloudflare re-establishes the WS
- *   to our server. We detect this via the CF-Ray header change and emit a
- *   HOST_FAILOVER signal to clients, triggering reconnect on the new tunnel path.
- *
- * QUIC-5: Larger binary frame budget
- *   QUIC's congestion control is better than TCP's for lossy links (uses BBR by
- *   default on Cloudflare's edge). We raise the fair-queue small-frame threshold
- *   from 256 → 512 bytes, since QUIC handles out-of-order delivery natively and
- *   the HOL-blocking risk is lower.
- *
- * All prior RELAY-PERF optimisations are retained and noted inline.
+ * Workers differences from Node ws:
+ *  - WebSocket API is the browser-standard API (no ws library)
+ *  - setInterval / setTimeout work normally inside Durable Objects
+ *  - No process / require — use ES modules
+ *  - Binary data arrives as ArrayBuffer (not Buffer)
  */
 
-'use strict';
-
-const WebSocket = require('ws');
-
-// ── Session store ─────────────────────────────────────────────────
-const sessions    = new Map();  // code → { host, clients, createdAt, netType, hostRay }
-const connections = new Map();  // ws   → { role, code, id, cfRay, isQuic }
-
 const CODE_CHARS         = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const SESSION_TIMEOUT_MS = parseInt(process.env.SESSION_TIMEOUT_MS) || 3_600_000;
-const MAX_CLIENTS        = parseInt(process.env.MAX_CLIENTS_PER_HOST) || 5;
+const SESSION_TIMEOUT_MS = 3_600_000;   // 1 hour
+const MAX_CLIENTS        = 5;
+const SMALL_FRAME        = 512;         // QUIC-5
+const MAX_BUFFERED       = 256 * 1024;  // RELAY-PERF-4 back-pressure limit
 
-// QUIC-5: Raised from 256 → 512 bytes (QUIC handles reordering natively)
-// RELAY-PERF-4: Drop frames if client WS buffer exceeds 256KB
-const SMALL_FRAME_THRESHOLD     = 512;
-const MAX_CLIENT_BUFFERED_BYTES = 256 * 1024;
+// ── Helpers ────────────────────────────────────────────────────────────
 
-function generateCode() {
+function generateCode(sessions) {
   let code;
   do {
-    const part1 = Array.from({ length: 4 }, () =>
+    const p1 = Array.from({ length: 4 }, () =>
       CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]
     ).join('');
-    const part2 = Array.from({ length: 4 }, () =>
+    const p2 = Array.from({ length: 4 }, () =>
       CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]
     ).join('');
-    code = `${part1}-${part2}`;
+    code = `${p1}-${p2}`;
   } while (sessions.has(code));
   return code;
 }
 
 function send(ws, obj) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(obj));
-  }
+  try {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
+  } catch (_) {}
 }
 
-// QUIC-1: Parse Cloudflare request headers for accurate IP + QUIC detection.
-// Returns { clientIp, cfRay, isQuic } from the upgrade request headers.
-function parseCfHeaders(req) {
-  const clientIp = req.headers['cf-connecting-ip']
-    || req.headers['x-forwarded-for']
-    || req.socket.remoteAddress
+// RELAY-PERF-4: back-pressure guard + QUIC-5: small-frame threshold
+function sendBinary(ws, data) {
+  try {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (ws.bufferedAmount > MAX_BUFFERED) return; // drop — client too slow
+    const len = data instanceof ArrayBuffer ? data.byteLength : (data.length || 0);
+    if (len <= SMALL_FRAME) {
+      ws.send(data);
+    } else {
+      // Defer large frames one microtask for fair interleaving
+      Promise.resolve().then(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(data);
+      });
+    }
+  } catch (_) {}
+}
+
+// QUIC-1: parse Cloudflare headers
+function parseCfHeaders(request) {
+  const clientIp = request.headers.get('cf-connecting-ip')
+    || request.headers.get('x-forwarded-for')
     || 'unknown';
-  const cfRay  = req.headers['cf-ray'] || null;
-  // CF-Visitor: {"scheme":"https"} — HTTP/3 connections come in as https
-  // We can't directly detect QUIC from CF-Visitor alone, but CF-Ray suffix
-  // contains the PoP; for logging we note that Cloudflare uses QUIC for all
-  // modern clients when HTTP/3 is enabled on the zone.
+  const cfRay = request.headers.get('cf-ray') || null;
   let isQuic = false;
   try {
-    const cfVisitor = req.headers['cf-visitor'];
+    const cfVisitor = request.headers.get('cf-visitor');
     if (cfVisitor) {
       const v = JSON.parse(cfVisitor);
-      // Cloudflare routes HTTP/3 clients to this tunnel; scheme will be 'https'
-      // and the CF-Ray will be present. True HTTP/1.1 direct connections lack CF-Ray.
-      isQuic = (v.scheme === 'https') && (cfRay !== null);
+      isQuic = v.scheme === 'https' && cfRay !== null;
     }
   } catch (_) {}
   return { clientIp, cfRay, isQuic };
 }
 
-// RELAY-PERF-2 / QUIC-2: Fair-queued binary send.
-// RELAY-PERF-3: { compress: false } for binary frames (encrypted data is incompressible)
-// QUIC-5: Small-frame threshold raised to 512 bytes
-function sendBinary(clientWs, data) {
-  if (clientWs.readyState !== WebSocket.OPEN) return;
+// ── Durable Object ─────────────────────────────────────────────────────
 
-  // RELAY-PERF-4: Back-pressure guard
-  if (clientWs.bufferedAmount > MAX_CLIENT_BUFFERED_BYTES) {
-    if (!clientWs._dropCount) clientWs._dropCount = 0;
-    clientWs._dropCount++;
-    if (clientWs._dropCount % 100 === 1) {
-      console.warn(
-        `[relay] Client buffer full (${clientWs.bufferedAmount} bytes), ` +
-        `dropped ${clientWs._dropCount} frames`
-      );
+export class RelaySession {
+  constructor(state, env) {
+    this.state = state;
+    this.env   = env;
+
+    // sessions: code → { host, clients: Set<ws>, createdAt, netType, hostRay, hostId }
+    this.sessions    = new Map();
+    // connections: ws → { role, code, id, cfRay, isQuic }
+    this.connections = new Map();
+
+    this._startHeartbeat();
+  }
+
+  // ── Durable Object fetch entry point ──────────────────────────────
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    if (url.pathname === '/stats') {
+      let totalClients = 0;
+      this.sessions.forEach(s => { totalClients += s.clients.size; });
+      return Response.json({
+        activeSessions: this.sessions.size,
+        totalClients,
+      });
     }
-    return;
+
+    // WebSocket upgrade
+    const { 0: client, 1: server } = new WebSocketPair();
+    this.state.acceptWebSocket(server);
+    this._handleConnection(server, request);
+    return new Response(null, { status: 101, webSocket: client });
   }
 
-  const frameLen = Buffer.isBuffer(data) ? data.length : (data.byteLength || 0);
+  // ── WebSocket lifecycle ────────────────────────────────────────────
+  _handleConnection(ws, request) {
+    const { clientIp, cfRay, isQuic } = parseCfHeaders(request);
+    console.log(`[relay] New WS from ${clientIp} QUIC=${isQuic} ray=${cfRay}`);
 
-  if (frameLen <= SMALL_FRAME_THRESHOLD) {
-    // Small frame: send immediately (DNS, WhatsApp ACKs, QUIC control packets)
-    clientWs.send(data, { binary: true, compress: false });
-  } else {
-    // Large frame: defer one event-loop tick for fair interleaving
-    setImmediate(() => {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(data, { binary: true, compress: false });
-      }
+    ws.addEventListener('message', (event) => {
+      this._onMessage(ws, event.data, cfRay, isQuic);
+    });
+
+    ws.addEventListener('close', () => {
+      this._onClose(ws, cfRay);
+    });
+
+    ws.addEventListener('error', (err) => {
+      console.error('[relay] WS error:', err);
     });
   }
-}
 
-function cleanupSession(code) {
-  const session = sessions.get(code);
-  if (!session) return;
-
-  session.clients.forEach(clientWs => {
-    send(clientWs, { type: 'HOST_LEFT', reason: 'Host disconnected' });
-    connections.delete(clientWs);
-  });
-
-  sessions.delete(code);
-  console.log(`[relay] Session ${code} cleaned up`);
-}
-
-function setupRelay(wss) {
-  // QUIC-3: Heartbeat reduced from 20s → 15s
-  // Cloudflare QUIC idle timeout is 30s; 15s interval keeps streams alive safely.
-  // The PING frame is 16 bytes → 8.5 bps average — negligible bandwidth cost.
-  const HEARTBEAT_INTERVAL_MS = 15_000;
-
-  const heartbeat = setInterval(() => {
-    sessions.forEach((session, code) => {
-      if (Date.now() - session.createdAt > SESSION_TIMEOUT_MS) {
-        console.log(`[relay] Session ${code} expired`);
-        cleanupSession(code);
-        return;
-      }
-      if (session.host?.readyState === WebSocket.OPEN) {
-        send(session.host, { type: 'PING' });
-      }
-      session.clients.forEach(ws => send(ws, { type: 'PING' }));
-    });
-  }, HEARTBEAT_INTERVAL_MS);
-
-  wss.on('close', () => clearInterval(heartbeat));
-
-  wss.on('connection', (ws, req) => {
-    // QUIC-1: Extract Cloudflare metadata for logging and migration detection
-    const { clientIp, cfRay, isQuic } = parseCfHeaders(req);
-    console.log(
-      `[relay] New connection from ${clientIp}` +
-      (cfRay ? ` | CF-Ray: ${cfRay}` : ' | direct (no Cloudflare)') +
-      (isQuic ? ' | transport: QUIC/HTTP3' : '')
-    );
-
-    ws.on('message', (data, isBinary) => {
-      // ── Binary packet: raw IP packet forwarding ──────────────
-      if (isBinary) {
-        const conn = connections.get(ws);
-        if (!conn) return;
-
-        const session = sessions.get(conn.code);
-        if (!session) return;
-
-        if (conn.role === 'client') {
-          if (session.host?.readyState === WebSocket.OPEN) {
-            sendBinary(session.host, data);
-          }
-        } else if (conn.role === 'host') {
-          // QUIC-2 / RELAY-PERF-2: Each client gets fair-queue treatment independently
-          session.clients.forEach(clientWs => {
-            sendBinary(clientWs, data);
-          });
-        }
-        return;
-      }
-
-      // ── Text message: control messages ───────────────────────
-      let msg;
-      try {
-        msg = JSON.parse(data.toString());
-      } catch {
-        return;
-      }
-
-      console.log(`[relay] Message: ${msg.type}`);
-
-      switch (msg.type) {
-
-        case 'HOST_REGISTER': {
-          const code = generateCode();
-          sessions.set(code, {
-            host:      ws,
-            clients:   new Set(),
-            createdAt: Date.now(),
-            netType:   msg.netType || 'WiFi',
-            hostRay:   cfRay,      // QUIC-4: track CF-Ray for migration detection
-          });
-          connections.set(ws, { role: 'host', code, id: `host-${code}`, cfRay, isQuic });
-
-          send(ws, { type: 'SESSION_CREATED', code, netType: msg.netType });
-          console.log(`[relay] Session ${code} created by host (QUIC: ${isQuic})`);
-          break;
-        }
-
-        case 'CLIENT_JOIN': {
-          const code = msg.accessCode || msg.code;
-          if (!code) return send(ws, { type: 'JOIN_ERROR', reason: 'No code provided' });
-
-          const session = sessions.get(code);
-          if (!session) return send(ws, { type: 'JOIN_ERROR', reason: 'Session not found' });
-          if (!session.host || session.host.readyState !== WebSocket.OPEN) {
-            return send(ws, { type: 'JOIN_ERROR', reason: 'Host is offline' });
-          }
-          if (session.clients.size >= MAX_CLIENTS) {
-            return send(ws, { type: 'JOIN_ERROR', reason: 'Session is full' });
-          }
-
-          const clientId = `client-${Date.now()}`;
-          session.clients.add(ws);
-          connections.set(ws, { role: 'client', code, id: clientId, cfRay, isQuic });
-
-          // Include assignedTunIp in JOIN_SUCCESS (set by host during SESSION_CREATED
-          // if host sends it, otherwise relay assigns one from the 10.8.x.x pool)
-          const clientIndex = session.clients.size; // 1-based
-          const tunIp = `10.8.0.${clientIndex + 1}`;
-          send(ws, { type: 'JOIN_SUCCESS', code, netType: session.netType, tunIp });
-          send(session.host, {
-            type: 'CLIENT_CONNECTED',
-            clientId,
-            totalClients: session.clients.size,
-            tunIp,
-          });
-          console.log(
-            `[relay] Client ${clientId} joined session ${code}` +
-            ` (QUIC: ${isQuic}) → assigned ${tunIp}`
-          );
-          break;
-        }
-
-        // QUIC-4: HOST_RECONNECT — emitted by the host after a QUIC connection migration.
-        // The host sends this after its WebSocket reconnects to re-associate with its session.
-        // We look up its existing session by hostId and re-attach the new ws as the host.
-        case 'HOST_RECONNECT': {
-          const existingCode = [...sessions.keys()].find(c => {
-            const s = sessions.get(c);
-            return s && msg.hostId && s.hostId === msg.hostId;
-          });
-          if (!existingCode) {
-            // No existing session — treat as fresh HOST_REGISTER
-            const code = generateCode();
-            sessions.set(code, {
-              host:      ws,
-              clients:   new Set(),
-              createdAt: Date.now(),
-              netType:   msg.netType || 'WiFi',
-              hostRay:   cfRay,
-              hostId:    msg.hostId,
-            });
-            connections.set(ws, { role: 'host', code, id: `host-${code}`, cfRay, isQuic });
-            send(ws, { type: 'SESSION_CREATED', code, netType: msg.netType });
-            console.log(`[relay] HOST_RECONNECT: new session ${code} for hostId=${msg.hostId}`);
-          } else {
-            const session = sessions.get(existingCode);
-            // Detach old host ws, attach new one
-            connections.delete(session.host);
-            session.host   = ws;
-            session.hostRay = cfRay;
-            connections.set(ws, { role: 'host', code: existingCode, id: `host-${existingCode}`, cfRay, isQuic });
-            send(ws, { type: 'SESSION_RESUMED', code: existingCode, netType: session.netType });
-            // Notify clients of the failover so they can flush any queued data
-            session.clients.forEach(clientWs => {
-              send(clientWs, { type: 'HOST_FAILOVER', newSessionCode: existingCode });
-            });
-            console.log(`[relay] HOST_RECONNECT: session ${existingCode} resumed for hostId=${msg.hostId}`);
-          }
-          break;
-        }
-
-        case 'PONG': {
-          // Client is alive — no action needed
-          break;
-        }
-
-        case 'HOST_LEAVE': {
-          const conn = connections.get(ws);
-          if (conn?.role === 'host') cleanupSession(conn.code);
-          break;
-        }
-
-        case 'CLIENT_LEAVE': {
-          const conn = connections.get(ws);
-          if (!conn) return;
-          const session = sessions.get(conn.code);
-          if (session) {
-            session.clients.delete(ws);
-            send(session.host, {
-              type: 'CLIENT_DISCONNECTED',
-              clientId: conn.id,
-              totalClients: session.clients.size,
-            });
-          }
-          connections.delete(ws);
-          break;
-        }
-
-        default:
-          console.warn(`[relay] Unknown message type: ${msg.type}`);
-      }
-    });
-
-    ws.on('close', () => {
-      const conn = connections.get(ws);
+  // ── Message handler ────────────────────────────────────────────────
+  _onMessage(ws, data, cfRay, isQuic) {
+    // Binary → raw IP packet forwarding
+    if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+      const conn = this.connections.get(ws);
       if (!conn) return;
+      const session = this.sessions.get(conn.code);
+      if (!session) return;
 
-      if (conn.role === 'host') {
-        // QUIC-4: On QUIC connection migration the host will reconnect via HOST_RECONNECT
-        // within a few hundred milliseconds. Delay cleanup by 5s to allow re-attachment
-        // before notifying clients that the host is gone.
-        setTimeout(() => {
-          const session = sessions.get(conn.code);
-          // Only clean up if the host ws has NOT been replaced by a reconnect
-          if (session && session.host === ws) {
-            cleanupSession(conn.code);
-          }
-        }, 5_000);
-      } else if (conn.role === 'client') {
-        const session = sessions.get(conn.code);
+      if (conn.role === 'client') {
+        if (session.host?.readyState === WebSocket.OPEN) {
+          sendBinary(session.host, data);
+        }
+      } else if (conn.role === 'host') {
+        session.clients.forEach(clientWs => sendBinary(clientWs, data));
+      }
+      return;
+    }
+
+    // Text → control message
+    let msg;
+    try { msg = JSON.parse(data); } catch { return; }
+    console.log(`[relay] msg=${msg.type}`);
+
+    switch (msg.type) {
+
+      case 'HOST_REGISTER': {
+        const code = generateCode(this.sessions);
+        this.sessions.set(code, {
+          host:      ws,
+          clients:   new Set(),
+          createdAt: Date.now(),
+          netType:   msg.netType || 'WiFi',
+          hostRay:   cfRay,
+          hostId:    msg.hostId || null,
+        });
+        this.connections.set(ws, { role: 'host', code, id: `host-${code}`, cfRay, isQuic });
+        send(ws, { type: 'SESSION_CREATED', code, netType: msg.netType });
+        console.log(`[relay] Session ${code} created (QUIC=${isQuic})`);
+        break;
+      }
+
+      case 'CLIENT_JOIN': {
+        const code = msg.accessCode || msg.code;
+        if (!code) return send(ws, { type: 'JOIN_ERROR', reason: 'No code provided' });
+
+        const session = this.sessions.get(code);
+        if (!session) return send(ws, { type: 'JOIN_ERROR', reason: 'Session not found' });
+        if (!session.host || session.host.readyState !== WebSocket.OPEN) {
+          return send(ws, { type: 'JOIN_ERROR', reason: 'Host is offline' });
+        }
+        if (session.clients.size >= MAX_CLIENTS) {
+          return send(ws, { type: 'JOIN_ERROR', reason: 'Session is full' });
+        }
+
+        const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
+        const tunIp    = `10.8.0.${session.clients.size + 2}`;
+
+        session.clients.add(ws);
+        this.connections.set(ws, { role: 'client', code, id: clientId, cfRay, isQuic, tunIp });
+
+        send(ws, { type: 'JOIN_SUCCESS', code, netType: session.netType, clientId, tunIp });
+        send(session.host, { type: 'CLIENT_CONNECTED', clientId, tunIp, totalClients: session.clients.size });
+        console.log(`[relay] Client ${clientId} joined ${code} → ${tunIp}`);
+        break;
+      }
+
+      // QUIC-4: host reconnects after QUIC connection migration
+      case 'HOST_RECONNECT': {
+        let existingCode = null;
+        for (const [c, s] of this.sessions) {
+          if (s.hostId && s.hostId === msg.hostId) { existingCode = c; break; }
+        }
+
+        if (!existingCode) {
+          // No existing session — fresh register
+          const code = generateCode(this.sessions);
+          this.sessions.set(code, {
+            host: ws, clients: new Set(), createdAt: Date.now(),
+            netType: msg.netType || 'WiFi', hostRay: cfRay, hostId: msg.hostId,
+          });
+          this.connections.set(ws, { role: 'host', code, id: `host-${code}`, cfRay, isQuic });
+          send(ws, { type: 'SESSION_CREATED', code, netType: msg.netType });
+          console.log(`[relay] HOST_RECONNECT: new session ${code} for hostId=${msg.hostId}`);
+        } else {
+          const session = this.sessions.get(existingCode);
+          this.connections.delete(session.host);
+          session.host    = ws;
+          session.hostRay = cfRay;
+          this.connections.set(ws, { role: 'host', code: existingCode, id: `host-${existingCode}`, cfRay, isQuic });
+          send(ws, { type: 'SESSION_RESUMED', code: existingCode, netType: session.netType });
+          session.clients.forEach(clientWs =>
+            send(clientWs, { type: 'HOST_FAILOVER', newSessionCode: existingCode })
+          );
+          console.log(`[relay] HOST_RECONNECT: resumed ${existingCode} for hostId=${msg.hostId}`);
+        }
+        break;
+      }
+
+      case 'PONG': break; // alive, nothing to do
+
+      case 'HOST_LEAVE': {
+        const conn = this.connections.get(ws);
+        if (conn?.role === 'host') this._cleanupSession(conn.code);
+        break;
+      }
+
+      case 'CLIENT_LEAVE': {
+        const conn = this.connections.get(ws);
+        if (!conn) return;
+        const session = this.sessions.get(conn.code);
         if (session) {
           session.clients.delete(ws);
           if (session.host?.readyState === WebSocket.OPEN) {
-            send(session.host, {
-              type:         'CLIENT_DISCONNECTED',
-              clientId:     conn.id,
-              totalClients: session.clients.size,
-            });
+            send(session.host, { type: 'CLIENT_DISCONNECTED', clientId: conn.id, totalClients: session.clients.size });
           }
         }
+        this.connections.delete(ws);
+        break;
       }
-      connections.delete(ws);
+
+      default:
+        console.warn(`[relay] Unknown type: ${msg.type}`);
+    }
+  }
+
+  // ── Close handler ──────────────────────────────────────────────────
+  _onClose(ws, cfRay) {
+    const conn = this.connections.get(ws);
+    if (!conn) return;
+
+    if (conn.role === 'host') {
+      // QUIC-4: delay 5s to allow reconnect before telling clients host is gone
+      setTimeout(() => {
+        const session = this.sessions.get(conn.code);
+        if (session && session.host === ws) {
+          this._cleanupSession(conn.code);
+        }
+      }, 5_000);
+    } else if (conn.role === 'client') {
+      const session = this.sessions.get(conn.code);
+      if (session) {
+        session.clients.delete(ws);
+        if (session.host?.readyState === WebSocket.OPEN) {
+          send(session.host, {
+            type: 'CLIENT_DISCONNECTED',
+            clientId: conn.id,
+            totalClients: session.clients.size,
+          });
+        }
+      }
+    }
+    this.connections.delete(ws);
+  }
+
+  // ── Session cleanup ────────────────────────────────────────────────
+  _cleanupSession(code) {
+    const session = this.sessions.get(code);
+    if (!session) return;
+    session.clients.forEach(clientWs => {
+      send(clientWs, { type: 'HOST_LEFT', reason: 'Host disconnected' });
+      this.connections.delete(clientWs);
     });
+    this.sessions.delete(code);
+    console.log(`[relay] Session ${code} cleaned up`);
+  }
 
-    ws.on('error', (err) => {
-      console.error(`[relay] WS error: ${err.message}`);
-    });
-  });
-
-  console.log(
-    '[relay] Relay handler attached ' +
-    '(heartbeat=15s, fair-queue=on, small-frame=512B, compress=off for binary, ' +
-    'QUIC/Cloudflare-Tunnel mode)'
-  );
+  // ── Heartbeat — QUIC-3: 15s interval ──────────────────────────────
+  _startHeartbeat() {
+    setInterval(() => {
+      const now = Date.now();
+      this.sessions.forEach((session, code) => {
+        if (now - session.createdAt > SESSION_TIMEOUT_MS) {
+          console.log(`[relay] Session ${code} expired`);
+          this._cleanupSession(code);
+          return;
+        }
+        if (session.host?.readyState === WebSocket.OPEN) {
+          send(session.host, { type: 'PING' });
+        }
+        session.clients.forEach(ws => send(ws, { type: 'PING' }));
+      });
+    }, 15_000);
+  }
 }
-
-function getStats() {
-  const stats = { activeSessions: sessions.size, totalClients: 0 };
-  sessions.forEach(s => { stats.totalClients += s.clients.size; });
-  return stats;
-}
-
-module.exports = { setupRelay, getStats };
