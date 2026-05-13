@@ -1,23 +1,13 @@
 {
-  "name": "netshare-business-backend",
-  "version": "2.0.0",
-  "description": "NetShare Business Platform relay server with admin, host management, and auto-failover",
-  "main": "src/server.js",
+  "name": "netshare-relay-worker",
+  "version": "3.0.0",
+  "description": "NetShare relay rewritten for Cloudflare Workers + Durable Objects",
+  "private": true,
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "nodemon src/server.js"
-  },
-  "dependencies": {
-    "ws": "^8.16.0",
-    "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "dotenv": "^16.3.1",
-    "uuid": "^9.0.0"
+    "dev":    "wrangler dev",
+    "deploy": "wrangler deploy"
   },
   "devDependencies": {
-    "nodemon": "^3.0.2"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "wrangler": "^3.57.0"
   }
 }
