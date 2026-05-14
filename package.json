@@ -1,7 +1,7 @@
 {
   "name": "netshare-relay-worker",
-  "version": "3.0.0",
-  "description": "NetShare relay rewritten for Cloudflare Workers + Durable Objects",
+  "version": "3.1.0",
+  "description": "NetShare relay — Cloudflare Workers + Durable Objects (Free Plan)",
   "private": true,
   "scripts": {
     "dev":    "wrangler dev",

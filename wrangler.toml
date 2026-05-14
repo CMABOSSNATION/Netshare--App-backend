@@ -1,18 +1,14 @@
-name            = "netshare-relay"
-main            = "src/index.js"
+name               = "netshare-relay"
+main               = "src/index.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# Durable Objects hold all session state across Worker instances
+# Durable Object — holds all WebSocket session state
 [[durable_objects.bindings]]
 name       = "RELAY"
 class_name = "RelaySession"
 
-# Required: tell Cloudflare where RelaySession is defined
+# new_sqlite_classes = works on FREE plan
 [[migrations]]
 tag = "v1"
-new_classes = ["RelaySession"]
-
-[vars]
-# Optional — override in Cloudflare dashboard or wrangler secret
-ADMIN_PASSWORD = "NETSHARE_ADMIN_2024"
+new_sqlite_classes = ["RelaySession"]
