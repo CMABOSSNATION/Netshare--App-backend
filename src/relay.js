@@ -236,13 +236,19 @@ export class RelaySession {
     // ── Validate code (used by VpnService.js before client joins) ──────────
     if (url.pathname === '/validate-code' && request.method === 'POST') {
       try {
-        const { code } = await request.json();
-        const upper = (code || '').toUpperCase();
-        // Check admin-issued access codes
-        const ac = await this._getAccessCode(upper);
+        const body     = await request.json();
+        const upper    = (body.code || '').toUpperCase();
+        const deviceId = (body.deviceId || '').trim();
+        const ac  = await this._getAccessCode(upper);
         const now = Date.now();
-        const valid = ac && ac.isActive && !ac.usedBy && new Date(ac.expiresAt).getTime() > now;
-        return json({ valid, reason: valid ? null : 'Invalid or expired access code' });
+        if (!ac || !ac.isActive || new Date(ac.expiresAt).getTime() < now) {
+          return json({ valid: false, reason: 'Invalid or expired access code' });
+        }
+        // If already claimed by a different device, reject early
+        if (ac.claimedBy && deviceId && ac.claimedBy !== deviceId) {
+          return json({ valid: false, reason: 'This access code is already in use by another device' });
+        }
+        return json({ valid: true, reason: null });
       } catch { return json({ valid: false, reason: 'Server error' }); }
     }
 
@@ -272,7 +278,7 @@ export class RelaySession {
         totalClients,
         onlineHosts:      hosts.filter(h => h.isOnline).length,
         totalHosts:       hosts.length,
-        activeAccessCodes: codes.filter(c => c.isActive && !c.usedBy && new Date(c.expiresAt).getTime() > now).length,
+        activeAccessCodes: codes.filter(c => c.isActive && new Date(c.expiresAt).getTime() > now).length,
       });
     }
 
@@ -293,12 +299,14 @@ export class RelaySession {
         for (let i = 0; i < count; i++) {
           const code = generateAccessCode();
           const data = {
-            isActive: true,
+            isActive:  true,
             label,
             createdAt: new Date().toISOString(),
             expiresAt: new Date(Date.now() + hours * 3_600_000).toISOString(),
-            usedBy: null,
-            usedAt: null,
+            claimedBy: null,
+            claimedAt: null,
+            usedBy:    null,
+            usedAt:    null,
           };
           await this._putAccessCode(code, data);
           codes.push({ code, ...data });
@@ -406,15 +414,37 @@ export class RelaySession {
       }
 
       case 'CLIENT_JOIN': {
-        const code = (msg.accessCode || msg.code || '').toUpperCase();
+        const code     = (msg.accessCode || msg.code || '').toUpperCase();
+        const deviceId = (msg.deviceId || '').trim();
         if (!code) return send(ws, { type: 'JOIN_ERROR', reason: 'No code provided' });
+        if (!deviceId) return send(ws, { type: 'JOIN_ERROR', reason: 'Device ID missing — update your app' });
 
-        // NEW: Validate admin-issued access code
-        const ac = await this._getAccessCode(code);
+        const ac  = await this._getAccessCode(code);
         const now = Date.now();
-        if (!ac || !ac.isActive || ac.usedBy || new Date(ac.expiresAt).getTime() < now) {
+
+        // Basic validity: must exist, be active, not expired
+        if (!ac || !ac.isActive || new Date(ac.expiresAt).getTime() < now) {
           return send(ws, { type: 'JOIN_ERROR', reason: 'Invalid or expired access code' });
         }
+
+        // ONE-DEVICE LOCK:
+        // - If code has never been used → claim it for this device
+        // - If code already claimed → only the same device can reconnect
+        // - Different device → permanently rejected until code expires/revoked
+        if (!ac.claimedBy) {
+          // First use — lock to this device
+          await this._putAccessCode(code, {
+            ...ac,
+            claimedBy: deviceId,
+            claimedAt: new Date().toISOString(),
+          });
+          console.log(`[relay] Code ${code} claimed by device ${deviceId.slice(0,8)}…`);
+        } else if (ac.claimedBy !== deviceId) {
+          // Different device — reject
+          console.log(`[relay] Code ${code} rejected — claimed by different device`);
+          return send(ws, { type: 'JOIN_ERROR', reason: 'This access code is already in use by another device' });
+        }
+        // Same device reconnecting — allowed, fall through
 
         // Find an available session (any online host, not full)
         let targetSession = null;
@@ -428,9 +458,6 @@ export class RelaySession {
         if (!targetSession) {
           return send(ws, { type: 'JOIN_ERROR', reason: 'No hosts available right now. Try again shortly.' });
         }
-
-        // Mark access code as used
-        await this._putAccessCode(code, { ...ac, usedBy: `client-${Date.now()}`, usedAt: new Date().toISOString() });
 
         const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
         const tunIp    = `10.8.0.${targetSession.clients.size + 2}`;
