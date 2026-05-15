@@ -1,24 +1,27 @@
 /**
  * relay.js — Cloudflare Durable Object (Free Plan)
  *
- * Uses new_sqlite_classes so it works on the FREE Workers plan.
- *
- * Features:
- *  - WebSocket host/client relay
- *  - Session codes (XXXX-XXXX format)
- *  - Up to 5 clients per session
- *  - Binary IP packet forwarding
- *  - 15s heartbeat (PING/PONG)
- *  - Host reconnect / failover
- *  - Back-pressure guard
- *  - CF header parsing (IP, Ray, QUIC)
+ * FIXES:
+ * FIX-1: Replaced setInterval heartbeat with DO alarm — setInterval is killed
+ *         by Cloudflare after ~30s of inactivity causing all sessions to drop.
+ * FIX-2: Added lastPong tracking — disconnect clients that stop responding
+ *         to PING after 2 missed cycles (60s) instead of keeping dead sockets.
+ * FIX-3: HOST_REGISTER now always replaces stale host for same hostId — prevents
+ *         ghost sessions that block reconnect.
+ * FIX-4: Relay /relay path now handles both GET and non-WS requests gracefully.
+ * FIX-5: CLIENT_JOIN now sends accessCode OR code field — handles both field names.
+ * FIX-6: Binary packet relay now checks tunOut buffer more carefully.
+ * FIX-7: Session timeout bumped to 6 hours for long business sessions.
+ * FIX-8: Added CORS headers so validate-code works from all origins.
  */
 
 const CODE_CHARS         = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const SESSION_TIMEOUT_MS = 3_600_000;  // 1 hour
+const SESSION_TIMEOUT_MS = 6 * 3_600_000;  // FIX-7: 6 hours
 const MAX_CLIENTS        = 5;
 const SMALL_FRAME        = 512;
 const MAX_BUFFERED       = 256 * 1024;
+const ALARM_INTERVAL_MS  = 20_000;         // FIX-1: alarm every 20s
+const PONG_TIMEOUT_MS    = 60_000;         // FIX-2: 2 missed PINGs = dead
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -38,20 +41,20 @@ function generateCode(sessions) {
 
 function send(ws, obj) {
   try {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   } catch (_) {}
 }
 
 function sendBinary(ws, data) {
   try {
-    if (ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     if (ws.bufferedAmount > MAX_BUFFERED) return;
     const len = data instanceof ArrayBuffer ? data.byteLength : (data.length || 0);
     if (len <= SMALL_FRAME) {
       ws.send(data);
     } else {
       Promise.resolve().then(() => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(data);
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send(data);
       });
     }
   } catch (_) {}
@@ -73,6 +76,14 @@ function parseCfHeaders(request) {
   return { clientIp, cfRay, isQuic };
 }
 
+function corsHeaders() {
+  return {
+    'Access-Control-Allow-Origin':  '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, x-requested-with',
+  };
+}
+
 // ── Durable Object ─────────────────────────────────────────────────────────
 
 export class RelaySession {
@@ -80,39 +91,105 @@ export class RelaySession {
     this.state = state;
     this.env   = env;
 
-    // sessions: code → { host, clients: Set<ws>, createdAt, netType, hostRay, hostId }
+    // sessions: code → { host, clients: Set<ws>, createdAt, netType, hostRay, hostId, lastPing }
     this.sessions    = new Map();
-    // connections: ws → { role, code, id, cfRay, isQuic, tunIp? }
+    // connections: ws → { role, code, id, cfRay, isQuic, tunIp?, lastPong }
     this.connections = new Map();
+    this._alarmScheduled = false;
+  }
 
-    this._startHeartbeat();
+  // ── Schedule alarm (FIX-1) ─────────────────────────────────────────────────
+  async _scheduleAlarm() {
+    if (this._alarmScheduled) return;
+    this._alarmScheduled = true;
+    try {
+      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+    } catch (_) {}
+  }
+
+  // ── Alarm handler — replaces setInterval (FIX-1) ──────────────────────────
+  async alarm() {
+    this._alarmScheduled = false;
+    const now = Date.now();
+
+    this.sessions.forEach((session, code) => {
+      // FIX-7: Expire old sessions
+      if (now - session.createdAt > SESSION_TIMEOUT_MS) {
+        this._cleanupSession(code);
+        return;
+      }
+
+      // FIX-2: Drop dead connections (no PONG for 60s)
+      const hostConn = session.host ? this.connections.get(session.host) : null;
+      if (session.host && session.host.readyState === WebSocket.OPEN) {
+        if (hostConn && now - hostConn.lastPong > PONG_TIMEOUT_MS) {
+          console.log(`[relay] Host dead (no pong) in session ${code}`);
+          try { session.host.close(1001, 'Ping timeout'); } catch (_) {}
+        } else {
+          send(session.host, { type: 'PING' });
+        }
+      }
+
+      session.clients.forEach(ws => {
+        const conn = this.connections.get(ws);
+        if (ws.readyState === WebSocket.OPEN) {
+          if (conn && now - conn.lastPong > PONG_TIMEOUT_MS) {
+            console.log(`[relay] Client dead (no pong) ${conn?.id}`);
+            try { ws.close(1001, 'Ping timeout'); } catch (_) {}
+          } else {
+            send(ws, { type: 'PING' });
+          }
+        }
+      });
+    });
+
+    // Reschedule if sessions still active
+    if (this.sessions.size > 0) {
+      await this._scheduleAlarm();
+    }
   }
 
   // ── Fetch entry point ──────────────────────────────────────────────────────
   async fetch(request) {
     const url = new URL(request.url);
 
-    // Stats endpoint
+    // FIX-8: CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+
     if (url.pathname === '/stats') {
       let totalClients = 0;
       this.sessions.forEach(s => { totalClients += s.clients.size; });
-      return Response.json({ activeSessions: this.sessions.size, totalClients });
+      return Response.json(
+        { activeSessions: this.sessions.size, totalClients },
+        { headers: corsHeaders() }
+      );
     }
 
-    // Validate code endpoint
+    // FIX-8: CORS on validate-code
     if (url.pathname === '/validate-code' && request.method === 'POST') {
       try {
         const { code } = await request.json();
         const valid = this.sessions.has((code || '').toUpperCase());
-        return Response.json({ valid, reason: valid ? null : 'Session not found' });
+        return Response.json(
+          { valid, reason: valid ? null : 'Session not found' },
+          { headers: corsHeaders() }
+        );
       } catch {
-        return Response.json({ valid: false, reason: 'Server error' });
+        return Response.json(
+          { valid: false, reason: 'Server error' },
+          { headers: corsHeaders() }
+        );
       }
     }
 
     // WebSocket upgrade
     if (request.headers.get('Upgrade') !== 'websocket') {
-      return new Response('Expected WebSocket', { status: 426 });
+      return new Response('NetShare Relay is running', {
+        status: 200,
+        headers: { 'Content-Type': 'text/plain', ...corsHeaders() },
+      });
     }
 
     const { 0: client, 1: server } = new WebSocketPair();
@@ -124,8 +201,11 @@ export class RelaySession {
   // ── WebSocket connection ───────────────────────────────────────────────────
   _handleConnection(ws, request) {
     const { clientIp, cfRay, isQuic } = parseCfHeaders(request);
-    console.log(`[relay] New WS from ${clientIp} QUIC=${isQuic} ray=${cfRay}`);
-
+    console.log(`[relay] New WS from ${clientIp} QUIC=${isQuic}`);
+    // FIX-2: track lastPong for dead connection detection
+    this.connections.set(ws, {
+      role: null, code: null, id: null, cfRay, isQuic, lastPong: Date.now()
+    });
     ws.addEventListener('message', e => this._onMessage(ws, e.data, cfRay, isQuic));
     ws.addEventListener('close',   () => this._onClose(ws));
     ws.addEventListener('error',   err => console.error('[relay] WS error:', err));
@@ -145,14 +225,22 @@ export class RelaySession {
       return;
     }
 
-    // Text — control messages
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
-    console.log(`[relay] msg=${msg.type}`);
 
     switch (msg.type) {
 
       case 'HOST_REGISTER': {
+        // FIX-3: Replace any existing session with same hostId
+        if (msg.hostId) {
+          for (const [c, s] of this.sessions) {
+            if (s.hostId === msg.hostId) {
+              console.log(`[relay] Replacing stale session ${c} for hostId ${msg.hostId}`);
+              this._cleanupSession(c);
+              break;
+            }
+          }
+        }
         const code = generateCode(this.sessions);
         this.sessions.set(code, {
           host:      ws,
@@ -162,13 +250,16 @@ export class RelaySession {
           hostRay:   cfRay,
           hostId:    msg.hostId || null,
         });
-        this.connections.set(ws, { role: 'host', code, id: `host-${code}`, cfRay, isQuic });
+        const conn = this.connections.get(ws) || {};
+        this.connections.set(ws, { ...conn, role: 'host', code, id: `host-${code}`, lastPong: Date.now() });
         send(ws, { type: 'SESSION_CREATED', code, netType: msg.netType });
         console.log(`[relay] Session ${code} created`);
+        this._scheduleAlarm();
         break;
       }
 
       case 'CLIENT_JOIN': {
+        // FIX-5: accept both accessCode and code fields
         const code = (msg.accessCode || msg.code || '').toUpperCase();
         if (!code) return send(ws, { type: 'JOIN_ERROR', reason: 'No code provided' });
         const session = this.sessions.get(code);
@@ -181,10 +272,12 @@ export class RelaySession {
         const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         const tunIp    = `10.8.0.${session.clients.size + 2}`;
         session.clients.add(ws);
-        this.connections.set(ws, { role: 'client', code, id: clientId, cfRay, isQuic, tunIp });
+        const conn = this.connections.get(ws) || {};
+        this.connections.set(ws, { ...conn, role: 'client', code, id: clientId, tunIp, lastPong: Date.now() });
         send(ws, { type: 'JOIN_SUCCESS', code, netType: session.netType, clientId, tunIp });
         send(session.host, { type: 'CLIENT_CONNECTED', clientId, tunIp, totalClients: session.clients.size });
         console.log(`[relay] Client ${clientId} joined ${code} → ${tunIp}`);
+        this._scheduleAlarm();
         break;
       }
 
@@ -199,23 +292,31 @@ export class RelaySession {
             host: ws, clients: new Set(), createdAt: Date.now(),
             netType: msg.netType || 'WiFi', hostRay: cfRay, hostId: msg.hostId,
           });
-          this.connections.set(ws, { role: 'host', code, id: `host-${code}`, cfRay, isQuic });
+          const conn = this.connections.get(ws) || {};
+          this.connections.set(ws, { ...conn, role: 'host', code, id: `host-${code}`, lastPong: Date.now() });
           send(ws, { type: 'SESSION_CREATED', code, netType: msg.netType });
         } else {
           const session = this.sessions.get(existingCode);
-          this.connections.delete(session.host);
+          if (session.host) this.connections.delete(session.host);
           session.host    = ws;
           session.hostRay = cfRay;
-          this.connections.set(ws, { role: 'host', code: existingCode, id: `host-${existingCode}`, cfRay, isQuic });
+          const conn = this.connections.get(ws) || {};
+          this.connections.set(ws, { ...conn, role: 'host', code: existingCode, id: `host-${existingCode}`, lastPong: Date.now() });
           send(ws, { type: 'SESSION_RESUMED', code: existingCode, netType: session.netType });
           session.clients.forEach(cws =>
             send(cws, { type: 'HOST_FAILOVER', newSessionCode: existingCode })
           );
         }
+        this._scheduleAlarm();
         break;
       }
 
-      case 'PONG': break;
+      case 'PONG': {
+        // FIX-2: update lastPong timestamp
+        const conn = this.connections.get(ws);
+        if (conn) conn.lastPong = Date.now();
+        break;
+      }
 
       case 'HOST_LEAVE': {
         const conn = this.connections.get(ws);
@@ -242,12 +343,19 @@ export class RelaySession {
 
   // ── Close handler ──────────────────────────────────────────────────────────
   _onClose(ws) {
-    const conn = this.connections.get(ws); if (!conn) return;
+    const conn = this.connections.get(ws); if (!conn || !conn.role) {
+      this.connections.delete(ws);
+      return;
+    }
     if (conn.role === 'host') {
+      // Give host 8s to reconnect before killing session
       setTimeout(() => {
         const session = this.sessions.get(conn.code);
-        if (session && session.host === ws) this._cleanupSession(conn.code);
-      }, 5_000);
+        if (session && session.host === ws) {
+          console.log(`[relay] Host did not reconnect, cleaning up ${conn.code}`);
+          this._cleanupSession(conn.code);
+        }
+      }, 8_000);
     } else if (conn.role === 'client') {
       const session = this.sessions.get(conn.code);
       if (session) {
@@ -266,22 +374,8 @@ export class RelaySession {
       send(cws, { type: 'HOST_LEFT', reason: 'Host disconnected' });
       this.connections.delete(cws);
     });
+    if (session.host) this.connections.delete(session.host);
     this.sessions.delete(code);
     console.log(`[relay] Session ${code} cleaned up`);
-  }
-
-  // ── Heartbeat — 15s interval ───────────────────────────────────────────────
-  _startHeartbeat() {
-    setInterval(() => {
-      const now = Date.now();
-      this.sessions.forEach((session, code) => {
-        if (now - session.createdAt > SESSION_TIMEOUT_MS) {
-          this._cleanupSession(code);
-          return;
-        }
-        if (session.host?.readyState === WebSocket.OPEN) send(session.host, { type: 'PING' });
-        session.clients.forEach(ws => send(ws, { type: 'PING' }));
-      });
-    }, 15_000);
   }
 }
