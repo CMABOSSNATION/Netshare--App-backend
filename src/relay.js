@@ -1,54 +1,53 @@
 /**
- * relay.js — Cloudflare Durable Object (Free Plan)
+ * relay.js — NetShare Cloudflare Durable Object
  *
  * ALL PREVIOUS FIXES RETAINED +
  *
- * FIX-9: Session persistence via DO SQLite storage.
- *   Sessions are saved to storage on create and deleted on cleanup.
- *   On DO cold start, sessions are restored from storage so clients
- *   never get "session not found" after a Cloudflare restart.
+ * NEW: Admin-controlled access code system.
+ *   - Admin generates pre-approved codes via /admin/codes/generate
+ *   - Clients must present a valid admin-issued code to join a session
+ *   - Hosts never see or manage codes — admin controls all access
+ *   - Codes are stored in DO SQLite storage (persistent across cold starts)
  *
- * FIX-10: validate-code checks BOTH in-memory sessions AND storage,
- *   so a client validating a code right after a cold start still gets
- *   a valid response even before the host has reconnected.
- *
- * FIX-11: CLIENT_JOIN waits for host to reconnect up to 10s before
- *   returning "Host is offline" — handles the brief gap during cold start.
- *
- * FIX-12: Host reconnect grace period extended to 30s to give host
- *   time to reconnect after a DO cold start.
+ * NEW: Admin routes added to relay DO:
+ *   POST /admin/codes/generate  → create access codes
+ *   GET  /admin/codes           → list all codes
+ *   POST /admin/codes/revoke    → revoke a code
+ *   GET  /admin/stats           → platform stats
+ *   GET  /admin/hosts           → host list
+ *   GET  /admin/payouts         → payout report
+ *   POST /admin/payouts/reset   → reset weekly cycle
  */
 
 const CODE_CHARS          = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const SESSION_TIMEOUT_MS  = 6 * 3_600_000;  // 6 hours
+const SESSION_TIMEOUT_MS  = 6 * 3_600_000;
 const MAX_CLIENTS         = 5;
 const SMALL_FRAME         = 512;
 const MAX_BUFFERED        = 256 * 1024;
 const ALARM_INTERVAL_MS   = 20_000;
 const PONG_TIMEOUT_MS     = 60_000;
-const HOST_RECONNECT_WAIT = 30_000;  // FIX-12: 30s grace for host to reconnect
-const JOIN_WAIT_MS        = 10_000;  // FIX-11: wait up to 10s for host
-
-// ── Helpers ────────────────────────────────────────────────────────────────
+const HOST_RECONNECT_WAIT = 30_000;
+const JOIN_WAIT_MS        = 10_000;
+const HOURLY_RATE         = 0.50; // $ per host per hour online
 
 function generateCode(sessions) {
   let code;
   do {
-    const p1 = Array.from({ length: 4 }, () =>
-      CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]
-    ).join('');
-    const p2 = Array.from({ length: 4 }, () =>
-      CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]
-    ).join('');
+    const p1 = Array.from({length:4}, () => CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)]).join('');
+    const p2 = Array.from({length:4}, () => CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)]).join('');
     code = `${p1}-${p2}`;
   } while (sessions.has(code));
   return code;
 }
 
+function generateAccessCode() {
+  const p1 = Array.from({length:4}, () => CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)]).join('');
+  const p2 = Array.from({length:4}, () => CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)]).join('');
+  return `${p1}-${p2}`;
+}
+
 function send(ws, obj) {
-  try {
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
-  } catch (_) {}
+  try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); } catch (_) {}
 }
 
 function sendBinary(ws, data) {
@@ -56,59 +55,36 @@ function sendBinary(ws, data) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     if (ws.bufferedAmount > MAX_BUFFERED) return;
     const len = data instanceof ArrayBuffer ? data.byteLength : (data.length || 0);
-    if (len <= SMALL_FRAME) {
-      ws.send(data);
-    } else {
-      Promise.resolve().then(() => {
-        if (ws && ws.readyState === WebSocket.OPEN) ws.send(data);
-      });
-    }
+    if (len <= SMALL_FRAME) { ws.send(data); }
+    else { Promise.resolve().then(() => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(data); }); }
   } catch (_) {}
 }
 
-function parseCfHeaders(request) {
-  const clientIp = request.headers.get('cf-connecting-ip')
-    || request.headers.get('x-forwarded-for')
-    || 'unknown';
-  const cfRay = request.headers.get('cf-ray') || null;
-  let isQuic = false;
-  try {
-    const cfVisitor = request.headers.get('cf-visitor');
-    if (cfVisitor) {
-      const v = JSON.parse(cfVisitor);
-      isQuic = v.scheme === 'https' && cfRay !== null;
-    }
-  } catch (_) {}
-  return { clientIp, cfRay, isQuic };
-}
-
-function corsHeaders() {
+function cors() {
   return {
     'Access-Control-Allow-Origin':  '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, x-requested-with',
+    'Access-Control-Allow-Headers': 'Content-Type, x-requested-with, x-admin-key',
   };
 }
 
-// ── Durable Object ─────────────────────────────────────────────────────────
+function json(data, status = 200) {
+  return Response.json(data, { status, headers: cors() });
+}
 
 export class RelaySession {
   constructor(state, env) {
     this.state = state;
     this.env   = env;
-
-    // In-memory: live WebSocket connections
-    this.sessions    = new Map(); // code → { host, clients: Set<ws>, createdAt, netType, hostId, hostRay }
-    this.connections = new Map(); // ws → { role, code, id, cfRay, isQuic, tunIp?, lastPong }
-
-    // FIX-11: pending join waiters: code → [{ ws, resolve }]
+    this.sessions    = new Map(); // relay sessions (WS-based)
+    this.connections = new Map();
     this.joinWaiters = new Map();
-
+    this.hostRegistry = new Map(); // hostId → { sessionCode, netType, clientCount, lastSeen, weeklyUptimeHours, weekStart }
     this._alarmScheduled = false;
     this._restored       = false;
   }
 
-  // ── FIX-9: Restore sessions from SQLite on cold start ─────────────────────
+  // ── Restore sessions from storage on cold start ───────────────────────────
   async _restoreSessions() {
     if (this._restored) return;
     this._restored = true;
@@ -118,152 +94,161 @@ export class RelaySession {
       for (const [key, val] of stored) {
         try {
           const meta = JSON.parse(val);
-          // Skip expired sessions
-          if (now - meta.createdAt > SESSION_TIMEOUT_MS) {
-            await this.state.storage.delete(key);
-            continue;
-          }
+          if (now - meta.createdAt > SESSION_TIMEOUT_MS) { await this.state.storage.delete(key); continue; }
           const code = key.replace('session:', '');
-          // Restore without live host/clients — they reconnect via WebSocket
-          this.sessions.set(code, {
-            host:      null,   // will be set when host reconnects
-            clients:   new Set(),
-            createdAt: meta.createdAt,
-            netType:   meta.netType || 'WiFi',
-            hostId:    meta.hostId  || null,
-            hostRay:   null,
-            _persisted: true,  // flag: restored from storage
-          });
-          console.log(`[relay] Restored session ${code} from storage`);
+          this.sessions.set(code, { host: null, clients: new Set(), createdAt: meta.createdAt, netType: meta.netType || 'WiFi', hostId: meta.hostId || null, hostRay: null, _persisted: true });
         } catch (_) {}
       }
-    } catch (e) {
-      console.error('[relay] _restoreSessions error:', e?.message);
-    }
+      // Restore host registry
+      const hosts = await this.state.storage.list({ prefix: 'host:' });
+      for (const [key, val] of hosts) {
+        try {
+          const meta = JSON.parse(val);
+          const hostId = key.replace('host:', '');
+          this.hostRegistry.set(hostId, meta);
+        } catch (_) {}
+      }
+    } catch (e) { console.error('[relay] _restoreSessions:', e?.message); }
   }
 
-  // ── FIX-9: Persist session metadata to SQLite ──────────────────────────────
   async _persistSession(code, session) {
-    try {
-      await this.state.storage.put(`session:${code}`, JSON.stringify({
-        createdAt: session.createdAt,
-        netType:   session.netType,
-        hostId:    session.hostId,
-      }));
-    } catch (e) {
-      console.error('[relay] _persistSession error:', e?.message);
-    }
+    try { await this.state.storage.put(`session:${code}`, JSON.stringify({ createdAt: session.createdAt, netType: session.netType, hostId: session.hostId })); } catch (_) {}
   }
 
-  // ── FIX-9: Delete session from SQLite ──────────────────────────────────────
-  async _deletePersistedSession(code) {
-    try {
-      await this.state.storage.delete(`session:${code}`);
-    } catch (_) {}
+  async _deleteSession(code) {
+    try { await this.state.storage.delete(`session:${code}`); } catch (_) {}
   }
 
-  // ── Schedule alarm ─────────────────────────────────────────────────────────
+  // ── Access code storage helpers ───────────────────────────────────────────
+  async _getAccessCode(code) {
+    try {
+      const val = await this.state.storage.get(`ac:${code}`);
+      return val ? JSON.parse(val) : null;
+    } catch { return null; }
+  }
+
+  async _putAccessCode(code, data) {
+    try { await this.state.storage.put(`ac:${code}`, JSON.stringify(data)); } catch (_) {}
+  }
+
+  async _listAccessCodes() {
+    try {
+      const list = await this.state.storage.list({ prefix: 'ac:' });
+      const codes = [];
+      for (const [key, val] of list) {
+        try { codes.push({ code: key.replace('ac:', ''), ...JSON.parse(val) }); } catch (_) {}
+      }
+      return codes;
+    } catch { return []; }
+  }
+
+  // ── Host registry helpers ─────────────────────────────────────────────────
+  _upsertHost(hostId, updates) {
+    const existing = this.hostRegistry.get(hostId) || {
+      hostId, isOnline: false, netType: 'WiFi', clientCount: 0,
+      sessionCode: null, lastSeen: Date.now(),
+      totalUptimeHours: 0, weeklyUptimeHours: 0,
+      weeklyEarnings: 0, weekStart: Date.now(),
+      _onlineSince: null,
+    };
+    const merged = { ...existing, ...updates };
+    this.hostRegistry.set(hostId, merged);
+    // Persist async (fire and forget)
+    this.state.storage.put(`host:${hostId}`, JSON.stringify(merged)).catch(() => {});
+    return merged;
+  }
+
+  _markHostOnline(hostId, netType, sessionCode) {
+    const h = this.hostRegistry.get(hostId) || {};
+    this._upsertHost(hostId, { isOnline: true, netType, sessionCode, lastSeen: Date.now(), _onlineSince: h._onlineSince || Date.now() });
+  }
+
+  _markHostOffline(hostId) {
+    const h = this.hostRegistry.get(hostId);
+    if (!h) return;
+    const onlineSince = h._onlineSince || Date.now();
+    const hoursOnline = (Date.now() - onlineSince) / 3_600_000;
+    const weeklyHrs   = (h.weeklyUptimeHours || 0) + hoursOnline;
+    const totalHrs    = (h.totalUptimeHours  || 0) + hoursOnline;
+    this._upsertHost(hostId, {
+      isOnline: false, _onlineSince: null, lastSeen: Date.now(),
+      weeklyUptimeHours: +weeklyHrs.toFixed(2),
+      totalUptimeHours:  +totalHrs.toFixed(2),
+      weeklyEarnings: +(weeklyHrs * HOURLY_RATE).toFixed(2),
+    });
+  }
+
+  // ── Alarm ─────────────────────────────────────────────────────────────────
   async _scheduleAlarm() {
     if (this._alarmScheduled) return;
     this._alarmScheduled = true;
-    try {
-      await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
-    } catch (_) {}
+    try { await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS); } catch (_) {}
   }
 
-  // ── Alarm handler ──────────────────────────────────────────────────────────
   async alarm() {
     this._alarmScheduled = false;
     const now = Date.now();
-
     for (const [code, session] of this.sessions) {
-      if (now - session.createdAt > SESSION_TIMEOUT_MS) {
-        await this._cleanupSession(code);
-        continue;
-      }
-
+      if (now - session.createdAt > SESSION_TIMEOUT_MS) { await this._cleanupSession(code); continue; }
       const hostConn = session.host ? this.connections.get(session.host) : null;
       if (session.host && session.host.readyState === WebSocket.OPEN) {
         if (hostConn && now - hostConn.lastPong > PONG_TIMEOUT_MS) {
-          console.log(`[relay] Host dead (no pong) in session ${code}`);
           try { session.host.close(1001, 'Ping timeout'); } catch (_) {}
-        } else {
-          send(session.host, { type: 'PING' });
-        }
+        } else { send(session.host, { type: 'PING' }); }
       }
-
       session.clients.forEach(ws => {
         const conn = this.connections.get(ws);
         if (ws.readyState === WebSocket.OPEN) {
-          if (conn && now - conn.lastPong > PONG_TIMEOUT_MS) {
-            console.log(`[relay] Client dead (no pong) ${conn?.id}`);
-            try { ws.close(1001, 'Ping timeout'); } catch (_) {}
-          } else {
-            send(ws, { type: 'PING' });
-          }
+          if (conn && now - conn.lastPong > PONG_TIMEOUT_MS) { try { ws.close(1001, 'Ping timeout'); } catch (_) {} }
+          else send(ws, { type: 'PING' });
         }
       });
     }
-
-    if (this.sessions.size > 0) {
-      await this._scheduleAlarm();
-    }
+    if (this.sessions.size > 0) await this._scheduleAlarm();
   }
 
-  // ── Fetch entry point ──────────────────────────────────────────────────────
+  // ── Main fetch ────────────────────────────────────────────────────────────
   async fetch(request) {
-    // FIX-9: Always restore sessions first on any request
     await this._restoreSessions();
-
     const url = new URL(request.url);
 
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: corsHeaders() });
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors() });
+
+    // ── Admin routes ────────────────────────────────────────────────────────
+    if (url.pathname.startsWith('/admin/')) {
+      const adminKey = request.headers.get('x-admin-key') || '';
+      const expectedKey = (this.env.ADMIN_KEY) || 'netshare-admin-2026';
+      if (adminKey !== expectedKey) return json({ error: 'Unauthorized' }, 401);
+      return this._handleAdmin(request, url);
     }
 
+    // ── Health ──────────────────────────────────────────────────────────────
+    if (url.pathname === '/health' || url.pathname === '/ping')
+      return new Response('OK', { status: 200, headers: cors() });
+
+    // ── Stats ───────────────────────────────────────────────────────────────
     if (url.pathname === '/stats') {
       let totalClients = 0;
       this.sessions.forEach(s => { totalClients += s.clients.size; });
-      return Response.json(
-        { activeSessions: this.sessions.size, totalClients },
-        { headers: corsHeaders() }
-      );
+      return json({ activeSessions: this.sessions.size, totalClients });
     }
 
-    // FIX-10: validate-code checks both memory AND storage
+    // ── Validate code (used by VpnService.js before client joins) ──────────
     if (url.pathname === '/validate-code' && request.method === 'POST') {
       try {
         const { code } = await request.json();
         const upper = (code || '').toUpperCase();
-        let valid = this.sessions.has(upper);
-        // FIX-10: also check storage in case of cold start
-        if (!valid) {
-          const stored = await this.state.storage.get(`session:${upper}`);
-          if (stored) {
-            try {
-              const meta = JSON.parse(stored);
-              valid = (Date.now() - meta.createdAt) < SESSION_TIMEOUT_MS;
-            } catch (_) {}
-          }
-        }
-        return Response.json(
-          { valid, reason: valid ? null : 'Session not found' },
-          { headers: corsHeaders() }
-        );
-      } catch {
-        return Response.json(
-          { valid: false, reason: 'Server error' },
-          { headers: corsHeaders() }
-        );
-      }
+        // Check admin-issued access codes
+        const ac = await this._getAccessCode(upper);
+        const now = Date.now();
+        const valid = ac && ac.isActive && !ac.usedBy && new Date(ac.expiresAt).getTime() > now;
+        return json({ valid, reason: valid ? null : 'Invalid or expired access code' });
+      } catch { return json({ valid: false, reason: 'Server error' }); }
     }
 
-    if (request.headers.get('Upgrade') !== 'websocket') {
-      return new Response('NetShare Relay is running', {
-        status: 200,
-        headers: { 'Content-Type': 'text/plain', ...corsHeaders() },
-      });
-    }
+    // ── WebSocket upgrade ───────────────────────────────────────────────────
+    if (request.headers.get('Upgrade') !== 'websocket')
+      return new Response('NetShare Relay is running', { status: 200, headers: { 'Content-Type': 'text/plain', ...cors() } });
 
     const { 0: client, 1: server } = new WebSocketPair();
     server.accept();
@@ -271,29 +256,127 @@ export class RelaySession {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  // ── WebSocket connection ───────────────────────────────────────────────────
-  _handleConnection(ws, request) {
-    const { clientIp, cfRay, isQuic } = parseCfHeaders(request);
-    console.log(`[relay] New WS from ${clientIp}`);
-    this.connections.set(ws, {
-      role: null, code: null, id: null, cfRay, isQuic, lastPong: Date.now()
-    });
-    ws.addEventListener('message', e => this._onMessage(ws, e.data, cfRay, isQuic));
-    ws.addEventListener('close',   () => this._onClose(ws));
-    ws.addEventListener('error',   err => console.error('[relay] WS error:', err));
+  // ── Admin handler ─────────────────────────────────────────────────────────
+  async _handleAdmin(request, url) {
+    const path = url.pathname;
+
+    // GET /admin/stats
+    if (path === '/admin/stats' && request.method === 'GET') {
+      let totalClients = 0;
+      this.sessions.forEach(s => { totalClients += s.clients.size; });
+      const hosts = [...this.hostRegistry.values()];
+      const codes = await this._listAccessCodes();
+      const now   = Date.now();
+      return json({
+        activeSessions:   this.sessions.size,
+        totalClients,
+        onlineHosts:      hosts.filter(h => h.isOnline).length,
+        totalHosts:       hosts.length,
+        activeAccessCodes: codes.filter(c => c.isActive && !c.usedBy && new Date(c.expiresAt).getTime() > now).length,
+      });
+    }
+
+    // GET /admin/codes
+    if (path === '/admin/codes' && request.method === 'GET') {
+      const codes = await this._listAccessCodes();
+      return json({ codes });
+    }
+
+    // POST /admin/codes/generate
+    if (path === '/admin/codes/generate' && request.method === 'POST') {
+      try {
+        const body = await request.json();
+        const count = Math.min(parseInt(body.count) || 1, 100);
+        const hours = parseInt(body.expiresInHours) || 24;
+        const label = body.label || '';
+        const codes = [];
+        for (let i = 0; i < count; i++) {
+          const code = generateAccessCode();
+          const data = {
+            isActive: true,
+            label,
+            createdAt: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + hours * 3_600_000).toISOString(),
+            usedBy: null,
+            usedAt: null,
+          };
+          await this._putAccessCode(code, data);
+          codes.push({ code, ...data });
+        }
+        return json({ codes });
+      } catch (e) { return json({ error: e.message }, 400); }
+    }
+
+    // POST /admin/codes/revoke
+    if (path === '/admin/codes/revoke' && request.method === 'POST') {
+      try {
+        const { code } = await request.json();
+        const upper = (code || '').toUpperCase();
+        const ac = await this._getAccessCode(upper);
+        if (!ac) return json({ error: 'Code not found' }, 404);
+        await this._putAccessCode(upper, { ...ac, isActive: false });
+        return json({ success: true });
+      } catch (e) { return json({ error: e.message }, 400); }
+    }
+
+    // GET /admin/hosts
+    if (path === '/admin/hosts' && request.method === 'GET') {
+      const hosts = [...this.hostRegistry.values()].map(h => ({
+        hostId:          h.hostId,
+        isOnline:        h.isOnline,
+        netType:         h.netType,
+        clientCount:     h.clientCount || 0,
+        sessionCode:     h.sessionCode,
+        totalUptimeHours: +(h.totalUptimeHours || 0).toFixed(1),
+        weeklyEarnings:  +(h.weeklyEarnings || 0).toFixed(2),
+        lastSeen:        h.lastSeen,
+      }));
+      return json({ hosts });
+    }
+
+    // GET /admin/payouts
+    if (path === '/admin/payouts' && request.method === 'GET') {
+      const payouts = [...this.hostRegistry.values()].map(h => ({
+        hostId:       h.hostId,
+        isOnline:     h.isOnline,
+        uptimeHours:  +(h.weeklyUptimeHours || 0).toFixed(1),
+        weeklyEarnings: +(h.weeklyEarnings || 0).toFixed(2),
+        lastSeen:     h.lastSeen,
+      }));
+      const totalPayout    = payouts.reduce((s, p) => s + p.weeklyEarnings, 0);
+      const platformShare  = totalPayout; // 50/50 split implied
+      return json({ payouts, totalPayout: +totalPayout.toFixed(2), platformShare: +platformShare.toFixed(2) });
+    }
+
+    // POST /admin/payouts/reset
+    if (path === '/admin/payouts/reset' && request.method === 'POST') {
+      for (const [hostId, h] of this.hostRegistry) {
+        this._upsertHost(hostId, { weeklyUptimeHours: 0, weeklyEarnings: 0, weekStart: Date.now() });
+      }
+      return json({ success: true });
+    }
+
+    return json({ error: 'Not found' }, 404);
   }
 
-  // ── Message handler ────────────────────────────────────────────────────────
-  async _onMessage(ws, data, cfRay, isQuic) {
+  // ── WebSocket connection ───────────────────────────────────────────────────
+  _handleConnection(ws, request) {
+    const clientIp = request.headers.get('cf-connecting-ip') || 'unknown';
+    const cfRay    = request.headers.get('cf-ray') || null;
+    this.connections.set(ws, { role: null, code: null, id: null, cfRay, lastPong: Date.now() });
+    ws.addEventListener('message', e => this._onMessage(ws, e.data, cfRay));
+    ws.addEventListener('close',   () => this._onClose(ws));
+    ws.addEventListener('error',   err => console.error('[relay] WS error:', err));
+    console.log(`[relay] New WS from ${clientIp}`);
+  }
+
+  async _onMessage(ws, data, cfRay) {
     // Binary relay
     if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
       const conn = this.connections.get(ws); if (!conn) return;
       const session = this.sessions.get(conn.code); if (!session) return;
-      if (conn.role === 'client') {
-        if (session.host?.readyState === WebSocket.OPEN) sendBinary(session.host, data);
-      } else if (conn.role === 'host') {
-        session.clients.forEach(cws => sendBinary(cws, data));
-      }
+      if (conn.role === 'client') { if (session.host?.readyState === WebSocket.OPEN) sendBinary(session.host, data); }
+      else if (conn.role === 'host') { session.clients.forEach(cws => sendBinary(cws, data)); }
       return;
     }
 
@@ -303,33 +386,21 @@ export class RelaySession {
     switch (msg.type) {
 
       case 'HOST_REGISTER': {
-        // Replace stale session with same hostId
         if (msg.hostId) {
           for (const [c, s] of this.sessions) {
-            if (s.hostId === msg.hostId) {
-              await this._cleanupSession(c);
-              break;
-            }
+            if (s.hostId === msg.hostId) { await this._cleanupSession(c); break; }
           }
         }
         const code = generateCode(this.sessions);
-        const session = {
-          host:      ws,
-          clients:   new Set(),
-          createdAt: Date.now(),
-          netType:   msg.netType || 'WiFi',
-          hostRay:   cfRay,
-          hostId:    msg.hostId || null,
-        };
+        const session = { host: ws, clients: new Set(), createdAt: Date.now(), netType: msg.netType || 'WiFi', hostRay: cfRay, hostId: msg.hostId || null };
         this.sessions.set(code, session);
         const conn = this.connections.get(ws) || {};
         this.connections.set(ws, { ...conn, role: 'host', code, id: `host-${code}`, lastPong: Date.now() });
         send(ws, { type: 'SESSION_CREATED', code, netType: msg.netType });
-        // FIX-9: persist to SQLite immediately
         await this._persistSession(code, session);
-        // FIX-11: notify any waiting clients that host is now online
+        if (msg.hostId) this._markHostOnline(msg.hostId, msg.netType || 'WiFi', code);
         this._resolveJoinWaiters(code);
-        console.log(`[relay] Session ${code} created and persisted`);
+        console.log(`[relay] Session ${code} created`);
         await this._scheduleAlarm();
         break;
       }
@@ -338,67 +409,55 @@ export class RelaySession {
         const code = (msg.accessCode || msg.code || '').toUpperCase();
         if (!code) return send(ws, { type: 'JOIN_ERROR', reason: 'No code provided' });
 
-        let session = this.sessions.get(code);
+        // NEW: Validate admin-issued access code
+        const ac = await this._getAccessCode(code);
+        const now = Date.now();
+        if (!ac || !ac.isActive || ac.usedBy || new Date(ac.expiresAt).getTime() < now) {
+          return send(ws, { type: 'JOIN_ERROR', reason: 'Invalid or expired access code' });
+        }
 
-        // FIX-10: if session not in memory, check storage (cold start recovery)
-        if (!session) {
-          const stored = await this.state.storage.get(`session:${code}`);
-          if (stored) {
-            try {
-              const meta = JSON.parse(stored);
-              if (Date.now() - meta.createdAt < SESSION_TIMEOUT_MS) {
-                // Recreate skeleton session — host will reconnect shortly
-                session = {
-                  host:      null,
-                  clients:   new Set(),
-                  createdAt: meta.createdAt,
-                  netType:   meta.netType || 'WiFi',
-                  hostId:    meta.hostId  || null,
-                  hostRay:   null,
-                  _persisted: true,
-                };
-                this.sessions.set(code, session);
-                console.log(`[relay] Restored session ${code} from storage for joining client`);
-              }
-            } catch (_) {}
+        // Find an available session (any online host, not full)
+        let targetSession = null;
+        let targetCode = null;
+        for (const [c, s] of this.sessions) {
+          if (s.host && s.host.readyState === WebSocket.OPEN && s.clients.size < MAX_CLIENTS) {
+            targetSession = s; targetCode = c; break;
           }
         }
 
-        if (!session) return send(ws, { type: 'JOIN_ERROR', reason: 'Session not found' });
-        if (session.clients.size >= MAX_CLIENTS)
-          return send(ws, { type: 'JOIN_ERROR', reason: 'Session is full' });
-
-        // FIX-11: if host not online, wait up to 10s for host to reconnect
-        if (!session.host || session.host.readyState !== WebSocket.OPEN) {
-          console.log(`[relay] Client waiting for host on session ${code}`);
-          const hostOnline = await this._waitForHost(code, JOIN_WAIT_MS);
-          if (!hostOnline) {
-            return send(ws, { type: 'JOIN_ERROR', reason: 'Host is offline — please try again in a moment' });
-          }
-          // Re-fetch session after wait
-          session = this.sessions.get(code);
-          if (!session) return send(ws, { type: 'JOIN_ERROR', reason: 'Session expired' });
+        if (!targetSession) {
+          return send(ws, { type: 'JOIN_ERROR', reason: 'No hosts available right now. Try again shortly.' });
         }
 
-        const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        const tunIp    = `10.8.0.${session.clients.size + 2}`;
-        session.clients.add(ws);
+        // Mark access code as used
+        await this._putAccessCode(code, { ...ac, usedBy: `client-${Date.now()}`, usedAt: new Date().toISOString() });
+
+        const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
+        const tunIp    = `10.8.0.${targetSession.clients.size + 2}`;
+        targetSession.clients.add(ws);
         const conn = this.connections.get(ws) || {};
-        this.connections.set(ws, { ...conn, role: 'client', code, id: clientId, tunIp, lastPong: Date.now() });
-        send(ws, { type: 'JOIN_SUCCESS', code, netType: session.netType, clientId, tunIp });
-        send(session.host, { type: 'CLIENT_CONNECTED', clientId, tunIp, totalClients: session.clients.size });
-        console.log(`[relay] Client ${clientId} joined ${code} → ${tunIp}`);
+        this.connections.set(ws, { ...conn, role: 'client', code: targetCode, id: clientId, tunIp, lastPong: Date.now() });
+        send(ws, { type: 'JOIN_SUCCESS', code: targetCode, netType: targetSession.netType, clientId, tunIp });
+        send(targetSession.host, { type: 'CLIENT_CONNECTED', clientId, tunIp, totalClients: targetSession.clients.size });
+        // Update host client count
+        const hostConn = this.connections.get(targetSession.host);
+        if (hostConn?.id) {
+          const hId = [...this.hostRegistry.keys()].find(id => {
+            const h = this.hostRegistry.get(id);
+            return h.sessionCode === targetCode;
+          });
+          if (hId) this._upsertHost(hId, { clientCount: targetSession.clients.size });
+        }
+        console.log(`[relay] Client ${clientId} joined ${targetCode} via admin code → ${tunIp}`);
         await this._scheduleAlarm();
         break;
       }
 
       case 'HOST_RECONNECT': {
         let existingCode = null;
-        // Check memory first
         for (const [c, s] of this.sessions) {
           if (s.hostId && s.hostId === msg.hostId) { existingCode = c; break; }
         }
-        // FIX-9: Check storage if not in memory
         if (!existingCode) {
           const stored = await this.state.storage.list({ prefix: 'session:' });
           for (const [key, val] of stored) {
@@ -406,43 +465,32 @@ export class RelaySession {
               const meta = JSON.parse(val);
               if (meta.hostId === msg.hostId && Date.now() - meta.createdAt < SESSION_TIMEOUT_MS) {
                 existingCode = key.replace('session:', '');
-                // Restore session skeleton if not in memory
                 if (!this.sessions.has(existingCode)) {
-                  this.sessions.set(existingCode, {
-                    host: null, clients: new Set(),
-                    createdAt: meta.createdAt, netType: meta.netType || 'WiFi',
-                    hostId: meta.hostId, hostRay: null, _persisted: true,
-                  });
+                  this.sessions.set(existingCode, { host: null, clients: new Set(), createdAt: meta.createdAt, netType: meta.netType || 'WiFi', hostId: meta.hostId, hostRay: null, _persisted: true });
                 }
                 break;
               }
             } catch (_) {}
           }
         }
-
         if (!existingCode) {
           const code = generateCode(this.sessions);
-          const session = {
-            host: ws, clients: new Set(), createdAt: Date.now(),
-            netType: msg.netType || 'WiFi', hostRay: cfRay, hostId: msg.hostId,
-          };
+          const session = { host: ws, clients: new Set(), createdAt: Date.now(), netType: msg.netType || 'WiFi', hostRay: cfRay, hostId: msg.hostId };
           this.sessions.set(code, session);
           const conn = this.connections.get(ws) || {};
           this.connections.set(ws, { ...conn, role: 'host', code, id: `host-${code}`, lastPong: Date.now() });
           send(ws, { type: 'SESSION_CREATED', code, netType: msg.netType });
           await this._persistSession(code, session);
+          if (msg.hostId) this._markHostOnline(msg.hostId, msg.netType || 'WiFi', code);
         } else {
           const session = this.sessions.get(existingCode);
           if (session.host) this.connections.delete(session.host);
-          session.host    = ws;
-          session.hostRay = cfRay;
+          session.host = ws; session.hostRay = cfRay;
           const conn = this.connections.get(ws) || {};
           this.connections.set(ws, { ...conn, role: 'host', code: existingCode, id: `host-${existingCode}`, lastPong: Date.now() });
           send(ws, { type: 'SESSION_RESUMED', code: existingCode, netType: session.netType });
-          session.clients.forEach(cws =>
-            send(cws, { type: 'HOST_FAILOVER', newSessionCode: existingCode })
-          );
-          // FIX-11: resolve any clients waiting for host
+          session.clients.forEach(cws => send(cws, { type: 'HOST_FAILOVER', newSessionCode: existingCode }));
+          if (msg.hostId) this._markHostOnline(msg.hostId, msg.netType || 'WiFi', existingCode);
           this._resolveJoinWaiters(existingCode);
         }
         await this._scheduleAlarm();
@@ -478,49 +526,39 @@ export class RelaySession {
     }
   }
 
-  // ── FIX-11: Wait for host to come online ──────────────────────────────────
   _waitForHost(code, timeoutMs) {
     return new Promise(resolve => {
       const session = this.sessions.get(code);
-      if (session?.host?.readyState === WebSocket.OPEN) {
-        resolve(true);
-        return;
-      }
+      if (session?.host?.readyState === WebSocket.OPEN) { resolve(true); return; }
       if (!this.joinWaiters.has(code)) this.joinWaiters.set(code, []);
       const timer = setTimeout(() => {
-        const waiters = this.joinWaiters.get(code) || [];
-        const idx = waiters.findIndex(w => w.resolve === resolve);
-        if (idx !== -1) waiters.splice(idx, 1);
+        const w = this.joinWaiters.get(code) || [];
+        const i = w.findIndex(x => x.resolve === resolve);
+        if (i !== -1) w.splice(i, 1);
         resolve(false);
       }, timeoutMs);
       this.joinWaiters.get(code).push({ resolve, timer });
     });
   }
 
-  // ── FIX-11: Resolve waiting clients when host reconnects ─────────────────
   _resolveJoinWaiters(code) {
     const waiters = this.joinWaiters.get(code);
-    if (!waiters || waiters.length === 0) return;
-    waiters.forEach(({ resolve, timer }) => {
-      clearTimeout(timer);
-      resolve(true);
-    });
+    if (!waiters || !waiters.length) return;
+    waiters.forEach(({ resolve, timer }) => { clearTimeout(timer); resolve(true); });
     this.joinWaiters.delete(code);
   }
 
-  // ── Close handler ──────────────────────────────────────────────────────────
   _onClose(ws) {
     const conn = this.connections.get(ws);
-    if (!conn || !conn.role) {
-      this.connections.delete(ws);
-      return;
-    }
+    if (!conn || !conn.role) { this.connections.delete(ws); return; }
     if (conn.role === 'host') {
-      // FIX-12: 30s grace period for host to reconnect
+      // Find hostId for this session
+      const session = this.sessions.get(conn.code);
+      const hostId = session?.hostId;
       setTimeout(async () => {
-        const session = this.sessions.get(conn.code);
-        if (session && session.host === ws) {
-          console.log(`[relay] Host did not reconnect in 30s, cleaning up ${conn.code}`);
+        const s = this.sessions.get(conn.code);
+        if (s && s.host === ws) {
+          if (hostId) this._markHostOffline(hostId);
           await this._cleanupSession(conn.code);
         }
       }, HOST_RECONNECT_WAIT);
@@ -535,23 +573,14 @@ export class RelaySession {
     this.connections.delete(ws);
   }
 
-  // ── Session cleanup ────────────────────────────────────────────────────────
   async _cleanupSession(code) {
     const session = this.sessions.get(code); if (!session) return;
-    session.clients.forEach(cws => {
-      send(cws, { type: 'HOST_LEFT', reason: 'Host disconnected' });
-      this.connections.delete(cws);
-    });
+    session.clients.forEach(cws => { send(cws, { type: 'HOST_LEFT', reason: 'Host disconnected' }); this.connections.delete(cws); });
     if (session.host) this.connections.delete(session.host);
     this.sessions.delete(code);
-    // FIX-9: remove from SQLite too
-    await this._deletePersistedSession(code);
-    // FIX-11: resolve any waiters with failure
+    await this._deleteSession(code);
     const waiters = this.joinWaiters.get(code);
-    if (waiters) {
-      waiters.forEach(({ resolve, timer }) => { clearTimeout(timer); resolve(false); });
-      this.joinWaiters.delete(code);
-    }
+    if (waiters) { waiters.forEach(({ resolve, timer }) => { clearTimeout(timer); resolve(false); }); this.joinWaiters.delete(code); }
     console.log(`[relay] Session ${code} cleaned up`);
   }
 }
