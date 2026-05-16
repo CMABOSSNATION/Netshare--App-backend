@@ -22,8 +22,8 @@
 const CODE_CHARS          = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const SESSION_TIMEOUT_MS  = 6 * 3_600_000;
 const MAX_CLIENTS         = 5;
-const SMALL_FRAME         = 512;
-const MAX_BUFFERED        = 256 * 1024;
+const SMALL_FRAME         = 4096;  // raised: include WhatsApp/TikTok QUIC ACK frames as "small"
+const MAX_BUFFERED        = 512 * 1024;  // raised: QUIC video bursts (TikTok/YT) need more buffer
 const ALARM_INTERVAL_MS   = 20_000;
 const PONG_TIMEOUT_MS     = 60_000;
 const HOST_RECONNECT_WAIT = 30_000;
