@@ -80,6 +80,10 @@ export class RelaySession {
     this.connections = new Map();
     this.joinWaiters = new Map();
     this.hostRegistry = new Map(); // hostId → { sessionCode, netType, clientCount, lastSeen, weeklyUptimeHours, weekStart }
+    // BUG-FIX: monotonically increasing per-session IP counter so IPs are never
+    // reused within a session even after clients disconnect (avoids IP collisions
+    // when clients reconnect while others are still active).
+    this.sessionIpCounters = new Map(); // sessionCode → next client index (starts at 1)
     this._alarmScheduled = false;
     this._restored       = false;
   }
@@ -446,21 +450,41 @@ export class RelaySession {
         }
         // Same device reconnecting — allowed, fall through
 
-        // Find an available session (any online host, not full)
+        // Find an available session (any online host, not full).
+        // BUG-FIX: if no host is up yet, wait up to JOIN_WAIT_MS for one to appear
+        // (previously _waitForHost was defined but never called, so clients that
+        // connected 1–2 s before the host got a permanent JOIN_ERROR).
         let targetSession = null;
         let targetCode = null;
-        for (const [c, s] of this.sessions) {
-          if (s.host && s.host.readyState === WebSocket.OPEN && s.clients.size < MAX_CLIENTS) {
-            targetSession = s; targetCode = c; break;
+        const findSession = () => {
+          for (const [c, s] of this.sessions) {
+            if (s.host && s.host.readyState === WebSocket.OPEN && s.clients.size < MAX_CLIENTS) {
+              return { s, c };
+            }
           }
+          return null;
+        };
+        let found = findSession();
+        if (!found) {
+          // Wait for any host session to become available
+          const firstSessionCode = this.sessions.size > 0 ? [...this.sessions.keys()][0] : '__any__';
+          const waited = await this._waitForHost(firstSessionCode, JOIN_WAIT_MS);
+          if (waited) found = findSession();
         }
-
-        if (!targetSession) {
+        if (!found) {
           return send(ws, { type: 'JOIN_ERROR', reason: 'No hosts available right now. Try again shortly.' });
         }
+        targetSession = found.s; targetCode = found.c;
+
+        // BUG-FIX: use a monotonic per-session counter for tunnel IPs instead of
+        // clients.size, which causes IP collisions when clients disconnect/reconnect
+        // (size decreases, so a new client gets the same .x as an existing one).
+        if (!this.sessionIpCounters.has(targetCode)) this.sessionIpCounters.set(targetCode, 1);
+        const ipIndex = this.sessionIpCounters.get(targetCode);
+        this.sessionIpCounters.set(targetCode, ipIndex + 1);
 
         const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
-        const tunIp    = `10.8.0.${targetSession.clients.size + 2}`;
+        const tunIp    = `10.8.0.${ipIndex + 1}`; // .2 for first client, .3 for second, etc.
         targetSession.clients.add(ws);
         const conn = this.connections.get(ws) || {};
         this.connections.set(ws, { ...conn, role: 'client', code: targetCode, id: clientId, tunIp, lastPong: Date.now() });
@@ -605,6 +629,7 @@ export class RelaySession {
     session.clients.forEach(cws => { send(cws, { type: 'HOST_LEFT', reason: 'Host disconnected' }); this.connections.delete(cws); });
     if (session.host) this.connections.delete(session.host);
     this.sessions.delete(code);
+    this.sessionIpCounters.delete(code); // BUG-FIX: free IP counter for this session
     await this._deleteSession(code);
     const waiters = this.joinWaiters.get(code);
     if (waiters) { waiters.forEach(({ resolve, timer }) => { clearTimeout(timer); resolve(false); }); this.joinWaiters.delete(code); }
