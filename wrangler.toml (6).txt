@@ -1,0 +1,17 @@
+name               = "netshare-relay"
+main               = "src/index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+name       = "RELAY"
+class_name = "TcpTunnelSession"
+
+# Tag bumped to v2 because the class name changed from RelaySession → TcpTunnelSession.
+# If you already deployed v2, leave this as-is. Only bump again on the next rename.
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["TcpTunnelSession"]
+
+[vars]
+ADMIN_KEY = "change-me"
