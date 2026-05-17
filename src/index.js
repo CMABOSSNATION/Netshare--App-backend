@@ -1,33 +1,22 @@
 /**
- * index.js — NetShare Relay Worker Entry Point v3
+ * index.js — NetShare Relay Worker Entry Point v4
  *
- * FIXES IN THIS VERSION:
+ * ROOT CAUSE FIX — Wrong WebSocket routing (caused all INIT timeout errors)
+ *   The previous version sent EVERY WebSocket connection to a tunnel shard DO,
+ *   including the broker connections (HOST_REGISTER, CLIENT_JOIN, HOST_RECONNECT).
+ *   Those broker connections never send an INIT message, so the tunnel shard
+ *   always hit INIT timeout and closed — making the host appear to connect then
+ *   immediately disconnect in a loop.
  *
- * FIX 1 — Broken 101 response reconstruction (root cause of WhatsApp/Facebook/Spotify failures)
- *   The old code cloned the DO's 101 response and tried to add headers. Cloudflare
- *   does not allow cloning WebSocket 101 responses across DO fetch boundaries —
- *   the internal webSocket handle is not transferable that way. We now forward
- *   the request directly and let the DO return its own 101 cleanly.
- *
- * FIX 2 — sessionId injected via header, not URL mutation
- *   Mutating the URL searchParams and rebuilding a Request added unnecessary latency
- *   and occasionally mangled URLs with special characters. Header injection is cleaner.
- *
- * FIX 3 — Admin routes explicitly caught before fallthrough
- *   Previously unknown paths fell through two stub.fetch() calls. Now one clean branch.
+ *   Fix: Only route to a tunnel shard when the request is explicitly for a tunnel
+ *   (path === '/tunnel' OR sessionId/hostId param is in the URL).
+ *   All other WebSocket connections go to the admin/broker DO as intended.
  */
 
 import { TcpTunnelSession } from './relay.js';
 export { TcpTunnelSession };
 
 const ADMIN_DO_NAME = 'global-admin';
-
-function resolveSessionId(url, request) {
-  const p = url.searchParams.get('sessionId')
-         || url.searchParams.get('hostId')
-         || request.headers.get('X-Session-Id');
-  return (p || crypto.randomUUID()).trim().slice(0, 64);
-}
 
 function getTunnelStub(env, sessionId) {
   return env.RELAY.get(env.RELAY.idFromName(`tunnel:${sessionId}`));
@@ -62,23 +51,35 @@ export default {
       return new Response('OK', { status: 200, headers: { 'Content-Type': 'text/plain', ...cors() } });
     }
 
-    // WebSocket upgrade → isolated tunnel shard
     if (request.headers.get('Upgrade') === 'websocket') {
-      const sessionId = resolveSessionId(url, request);
-      const stub      = getTunnelStub(env, sessionId);
+      // Route to tunnel shard ONLY when explicitly requested:
+      //   - path is /tunnel, OR
+      //   - sessionId or hostId query param is present
+      //
+      // All other WS connections (HOST_REGISTER, CLIENT_JOIN, HOST_RECONNECT)
+      // are broker connections and MUST go to the admin DO.
+      const explicitId = url.searchParams.get('sessionId') || url.searchParams.get('hostId');
+      const isTunnel   = path === '/tunnel' || Boolean(explicitId);
 
-      // Inject sessionId via header — DO reads X-Shard-Id and echoes it back
-      const fwdHeaders = new Headers(request.headers);
-      fwdHeaders.set('X-Shard-Id', sessionId);
+      if (isTunnel) {
+        const sessionId = explicitId
+          ? explicitId.trim().slice(0, 64)
+          : crypto.randomUUID();
 
-      // Forward directly — DO owns the WebSocketPair and returns the clean 101
-      return stub.fetch(new Request(request.url, {
-        method:  request.method,
-        headers: fwdHeaders,
-      }));
+        const fwdHeaders = new Headers(request.headers);
+        fwdHeaders.set('X-Shard-Id', sessionId);
+
+        return getTunnelStub(env, sessionId).fetch(new Request(request.url, {
+          method:  request.method,
+          headers: fwdHeaders,
+        }));
+      }
+
+      // Broker WebSocket (HOST_REGISTER / CLIENT_JOIN / HOST_RECONNECT) → admin DO
+      return getAdminStub(env).fetch(request);
     }
 
-    // Everything else → global admin DO (stats, codes, broker, admin routes)
+    // All HTTP routes → admin DO (stats, codes, admin panel)
     return getAdminStub(env).fetch(request);
   },
 };
