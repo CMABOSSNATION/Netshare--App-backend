@@ -275,7 +275,7 @@ export class TcpTunnelSession {
       const err = validateTarget(host, port);
       if (err) { this._closeTunnel(ws, 4001, `Invalid target: ${err}`); return; }
 
-      console.log(`[tunnel:${sessionId}] → ${host}:${port} tls=${useTls}`);
+      console.log(`[tunnel:${this._sessionId}] → ${host}:${port} tls=${useTls}`);
 
       // Step 3: open TCP socket
       let socket;
