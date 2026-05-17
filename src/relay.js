@@ -53,9 +53,9 @@ const MAX_CLIENTS         = 5;
 // FIX 3: raised from 512KB — we now queue instead of drop, so this is the
 // max queue size before we start applying real back-pressure to the TCP reader.
 const MAX_QUEUE_BYTES     = 2 * 1024 * 1024;  // 2 MB per-tunnel send queue
-const ALARM_INTERVAL_MS   = 20_000;
-const PONG_TIMEOUT_MS     = 60_000;
-const HOST_RECONNECT_WAIT = 30_000;
+const ALARM_INTERVAL_MS   = 30_000;   // check every 30s (was 20s)
+const PONG_TIMEOUT_MS     = 5 * 60_000; // 5 min before killing host (was 60s) — Android Doze can delay messages 30-90s
+const HOST_RECONNECT_WAIT = 60_000;   // give host 60s to reconnect (was 30s)
 const JOIN_WAIT_MS        = 10_000;
 const HOURLY_RATE         = 0.50;
 const INIT_TIMEOUT_MS     = 15_000;           // raised: some apps are slow to send INIT
@@ -550,11 +550,31 @@ export class TcpTunnelSession {
     this._alarmScheduled = false;
     const now = Date.now();
     for (const [code, session] of this.sessions) {
-      if (now - session.createdAt > SESSION_TIMEOUT_MS) { await this._cleanupSession(code); continue; }
+      const hostAlive = session.host?.readyState === WebSocket.OPEN;
+
+      // Only expire session if host is NOT connected — never kill an active host
+      if (now - session.createdAt > SESSION_TIMEOUT_MS && !hostAlive) {
+        await this._cleanupSession(code);
+        continue;
+      }
+
+      // If session is old but host is still alive, just refresh the createdAt
+      // so it doesn't get killed next alarm cycle
+      if (now - session.createdAt > SESSION_TIMEOUT_MS && hostAlive) {
+        session.createdAt = now;
+        await this._persistSession(code, session);
+      }
+
       const hConn = session.host ? this.connections.get(session.host) : null;
-      if (session.host?.readyState === WebSocket.OPEN) {
-        if (hConn && now - hConn.lastPong > PONG_TIMEOUT_MS) { try { session.host.close(1001, 'Ping timeout'); } catch (_) {} }
-        else sendJson(session.host, { type: 'PING' });
+      if (hostAlive) {
+        if (hConn && now - hConn.lastPong > PONG_TIMEOUT_MS) {
+          // Before killing, update lastPong if WS is still open — Android may
+          // have replied but the message is in-flight due to Doze mode
+          hConn.lastPong = now - (PONG_TIMEOUT_MS - 30_000); // give 30s more grace
+          try { session.host.close(1001, 'Ping timeout'); } catch (_) {}
+        } else {
+          sendJson(session.host, { type: 'PING' });
+        }
       }
       session.clients.forEach(ws => {
         const c = this.connections.get(ws);
@@ -773,6 +793,8 @@ export class TcpTunnelSession {
           if (msg.hostId) this._markHostOnline(msg.hostId, msg.netType||'WiFi', code);
         } else {
           const session = this.sessions.get(existingCode);
+          // Cancel any pending cleanup timer from _onBrokerClose
+          if (session._cleanupTimer) { clearTimeout(session._cleanupTimer); session._cleanupTimer = null; }
           if (session.host) this.connections.delete(session.host);
           session.host = ws; session.hostRay = cfRay;
           this.connections.set(ws, {...(this.connections.get(ws)||{}), role:'host', code:existingCode, id:`host-${existingCode}`, lastPong:Date.now()});
@@ -818,7 +840,20 @@ export class TcpTunnelSession {
     const conn=this.connections.get(ws); if(!conn?.role) { this.connections.delete(ws); return; }
     if (conn.role==='host') {
       const session=this.sessions.get(conn.code); const hostId=session?.hostId;
-      setTimeout(async()=>{ const s=this.sessions.get(conn.code); if(s&&s.host===ws) { if(hostId) this._markHostOffline(hostId); await this._cleanupSession(conn.code); } }, HOST_RECONNECT_WAIT);
+      // Mark host socket as null so HOST_RECONNECT can replace it cleanly,
+      // but keep the session alive for HOST_RECONNECT_WAIT (60s).
+      // Only destroy session if host has NOT reconnected by then.
+      if (session) session.host = null;
+      if (hostId) this._markHostOffline(hostId);
+      const cleanupTimer = setTimeout(async () => {
+        const s = this.sessions.get(conn.code);
+        // If host reconnected (session.host is a new live socket), don't cleanup
+        if (s && (s.host === null || s.host === ws)) {
+          await this._cleanupSession(conn.code);
+        }
+      }, HOST_RECONNECT_WAIT);
+      // Store timer so HOST_RECONNECT can cancel it
+      if (session) session._cleanupTimer = cleanupTimer;
     } else if (conn.role==='client') {
       const s=this.sessions.get(conn.code);
       if(s) { s.clients.delete(ws); if(s.host?.readyState===WebSocket.OPEN) sendJson(s.host,{type:'CLIENT_DISCONNECTED',clientId:conn.id,totalClients:s.clients.size}); }
