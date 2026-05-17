@@ -59,8 +59,10 @@ const HOST_RECONNECT_WAIT = 30_000;
 const JOIN_WAIT_MS        = 10_000;
 const HOURLY_RATE         = 0.50;
 const INIT_TIMEOUT_MS     = 15_000;           // raised: some apps are slow to send INIT
-// FIX 1: 256KB chunks for video apps
-const MAX_CHUNK_BYTES     = 256 * 1024;
+// OPTION D: max chunk before splitting — 1MB. In practice we send whatever
+// the TCP socket delivers in one read (adaptive), only splitting if a single
+// read exceeds this. Matches TikTok/YouTube segment sizes better than 256KB.
+const MAX_CHUNK_BYTES     = 1024 * 1024;  // 1 MB
 // FIX 6: above this threshold, yield one microtask before sending
 const YIELD_THRESHOLD     = 512 * 1024;
 
@@ -326,8 +328,13 @@ export class TcpTunnelSession {
   }
 
   /**
-   * FIX 4: _waitForInit now handles BOTH text and binary first frames.
-   * WhatsApp sends the first frame as binary-encoded JSON.
+   * OPTION B: _waitForInit resets the timeout on every frame received.
+   * WhatsApp keeps a persistent TCP socket and may send keepalive/handshake
+   * noise before the INIT frame. Previously those frames were silently ignored
+   * and the 15s clock kept ticking — causing INIT timeout on reconnect.
+   * Now: any frame at all (INIT or not) resets the clock, giving WhatsApp
+   * the full 15s from its last activity, not from the WebSocket open time.
+   * Also handles binary-encoded JSON (FIX 4) and text frames.
    */
   _waitForInit(ws) {
     return new Promise((resolve) => {
@@ -335,26 +342,27 @@ export class TcpTunnelSession {
 
       const tryParse = (raw) => {
         try {
-          // Text frame
           if (typeof raw === 'string') return JSON.parse(raw);
-          // Binary frame — attempt UTF-8 decode
-          if (raw instanceof ArrayBuffer) {
-            return JSON.parse(new TextDecoder().decode(raw));
-          }
-          if (ArrayBuffer.isView(raw)) {
-            return JSON.parse(new TextDecoder().decode(raw.buffer));
-          }
+          if (raw instanceof ArrayBuffer) return JSON.parse(new TextDecoder().decode(raw));
+          if (ArrayBuffer.isView(raw))   return JSON.parse(new TextDecoder().decode(raw.buffer));
         } catch (_) {}
         return null;
       };
 
+      const resetTimer = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => { cleanup(); resolve(null); }, INIT_TIMEOUT_MS);
+      };
+
       const onMessage = (event) => {
+        // Any frame resets the timeout — WhatsApp sends keepalives before INIT
+        resetTimer();
         const msg = tryParse(event.data);
         if (msg?.type === 'INIT' && msg.host) {
           cleanup();
           resolve(msg);
         }
-        // Non-INIT frames before INIT are ignored (don't close — app may send handshake noise)
+        // Non-INIT frames: clock is reset above, keep waiting
       };
 
       const onClose = () => { cleanup(); resolve(null); };
@@ -410,10 +418,12 @@ export class TcpTunnelSession {
 
   /**
    * TCP → WS pipe.
-   * FIX 1 (TikTok lag): 256KB chunks.
+   * OPTION D (adaptive chunk sizing): send whatever the TCP socket gives us in
+   *   one read as a single WS frame. TikTok/YouTube CDN segments arrive in
+   *   natural bursts (32KB–800KB). Splitting them artificially adds latency.
+   *   We only split if a single read truly exceeds MAX_CHUNK_BYTES (1MB).
    * FIX 3 (WhatsApp/Spotify): queue-based sender, no silent drops.
-   * FIX 6 (Facebook H2): each TCP read → single WS frame, no artificial splits
-   *        unless the read is truly massive (> MAX_CHUNK_BYTES).
+   * FIX 6 (Facebook H2): no artificial splitting below MAX_CHUNK_BYTES.
    */
   async _pipeTcpToWs(ws, socket) {
     const reader = socket.readable.getReader();
@@ -423,23 +433,19 @@ export class TcpTunnelSession {
         if (done) break;
         if (!value || value.byteLength === 0) continue;
 
-        // FIX 6: only chunk if the read exceeds MAX_CHUNK_BYTES (256KB).
-        // Normal HTTP/2 and HTTP/1.1 frames are well under this.
+        // OPTION D: send the full TCP read as one WS frame (adaptive).
+        // Only split if the read is truly massive (> 1MB) to avoid
+        // WebSocket frame size limits and WS buffer pressure.
         if (value.byteLength > MAX_CHUNK_BYTES) {
           for (let off = 0; off < value.byteLength; off += MAX_CHUNK_BYTES) {
             const chunk = value.slice(off, off + MAX_CHUNK_BYTES);
             const ok = this._sender.send(chunk.buffer);
-            if (!ok) {
-              // Queue full — pause briefly before reading more from TCP
-              await new Promise(r => setTimeout(r, 10));
-            }
+            if (!ok) await new Promise(r => setTimeout(r, 10));
           }
         } else {
-          // FIX 3: use queue-based sender so no frame is ever silently dropped
+          // Single frame — matches the natural TCP read size (adaptive)
           const ok = this._sender.send(value.buffer);
-          if (!ok) {
-            await new Promise(r => setTimeout(r, 10));
-          }
+          if (!ok) await new Promise(r => setTimeout(r, 10));
         }
       }
     } catch (e) {
