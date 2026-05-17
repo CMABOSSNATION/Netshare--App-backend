@@ -1,18 +1,21 @@
-name               = "netshare"
-main               = "src/index.js"
-compatibility_date = "2024-09-23"
-compatibility_flags = ["nodejs_compat"]
+name = "netshare-relay"
+main = "src/relay.js"
+compatibility_date = "2025-01-01"
 
-[[durable_objects.bindings]]
-name       = "RELAY"
-class_name = "TcpTunnelSession"
+# KV namespace for session storage
+# Create with: wrangler kv:namespace create SESSIONS
+# Then replace the id below with the output id
+[[kv_namespaces]]
+binding = "SESSIONS"
+id      = "YOUR_KV_NAMESPACE_ID"
 
-# v1 → v2: renamed RelaySession to TcpTunnelSession
-[[migrations]]
-tag = "v2"
-renamed_classes = [
-  { from = "RelaySession", to = "TcpTunnelSession" }
-]
+# Secrets (set with: wrangler secret put ADMIN_KEY)
+# ADMIN_KEY — for the /admin/sessions endpoint
 
 [vars]
-ADMIN_KEY = "change-me"
+# No vars needed — secrets go in wrangler secret put
+
+# The probe endpoint uses cloudflare:sockets to test TCP reachability
+# This requires nodejs_compat or the sockets flag
+[compatibility_flags]
+compatibility_flags = ["nodejs_compat"]
