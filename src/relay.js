@@ -1,24 +1,19 @@
 /**
  * relay.js — NetShare Proxy Session Durable Object
  *
- * ── Two modes of operation ────────────────────────────────────────────────────
+ * ── Global Tunnel Mode only (LAN mode removed) ───────────────────────────────
  *
- * MODE 1: Same-WiFi (LAN) — short range
- *   Host registers ip:port → client gets ip:port → configures Android proxy
- *   Traffic flows directly host ↔ client (NOT through Cloudflare)
- *
- * MODE 2: WebSocket Tunnel — any distance (300km+)
- *   Host connects via WebSocket to /ws/host/:code
- *   Client connects via WebSocket to /ws/client/:code
- *   This DO pairs them and pipes raw bytes both ways through Cloudflare
- *   Client-side: a local SOCKS/HTTP proxy server bridges the WebSocket tunnel
+ * Host connects via WebSocket to /ws/host/:code
+ * Client connects via WebSocket to /ws/client/:code
+ * This DO pairs them and pipes raw binary frames both ways through Cloudflare.
+ * Client uses Android VpnService — ALL device traffic (WiFi + mobile data)
+ * is captured and routed through the tunnel automatically. No manual setup.
  *
  * Session lifecycle:
- *   1. Host POSTs { ip, port, tunnelMode } to /register → gets { code, sessionId }
+ *   1. Host POSTs { ip, port, tunnelMode:true } to /register → { code, sessionId }
  *   2. Host POSTs to /ping every 30s to keep session alive
- *   3. Client GETs /join/:code → gets { ip, port, sessionId, tunnelMode }
- *   4a. Same-WiFi: client sets Android proxy to ip:port
- *   4b. Tunnel mode: host + client both open WSs → DO bridges them
+ *   3. Client GETs /join/:code → gets { sessionId }
+ *   4. Host + client both open WSs → DO bridges them with binary frame piping
  *   5. Host POSTs /deregister when done
  *
  * ── FIX LOG ───────────────────────────────────────────────────────────────────
@@ -186,9 +181,7 @@ export class ProxySession {
     if (path === '/register' && request.method === 'POST') {
       try {
         const { ip, port, type, tunnelMode } = await request.json();
-        if (!tunnelMode && (!ip || !port)) {
-          return jsonResp({ error: 'Missing ip or port' }, 400);
-        }
+        // tunnelMode is always true — ip/port are optional (tunnel doesn't need them)
 
         const code      = randomCode(this.proxySessions);
         const sessionId = crypto.randomUUID();

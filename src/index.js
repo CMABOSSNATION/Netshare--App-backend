@@ -1,16 +1,15 @@
 /**
- * index.js — NetShare Relay Worker
+ * index.js — NetShare Relay Worker (Global Tunnel Only)
  *
  * Routes:
- *   POST /register      → host registers { ip, port, tunnelMode } → { code, sessionId }
- *   GET  /join/:code    → client looks up code → { ip, port, sessionId, tunnelMode }
- *   POST /deregister    → host removes session
- *   POST /ping          → host keeps session alive
- *   POST /probe         → server-side reachability check (LAN mode only)
- *   GET  /health        → edge health check
- *   GET  /ws/host/:code → host WebSocket tunnel connection (long-distance mode)
- *   GET  /ws/client/:code → client WebSocket tunnel connection (long-distance mode)
- *   /admin/*            → admin routes
+ *   POST /register        → host registers → { code, sessionId }
+ *   GET  /join/:code      → client looks up session → { sessionId }
+ *   POST /deregister      → host removes session
+ *   POST /ping            → host keeps session alive
+ *   GET  /health          → edge health check
+ *   WS   /ws/host/:code   → host WebSocket tunnel (Cloudflare pipes to client)
+ *   WS   /ws/client/:code → client WebSocket tunnel (VPN routes all traffic here)
+ *   /admin/*              → admin routes
  */
 
 import { ProxySession } from './relay.js';
@@ -81,45 +80,7 @@ export default {
       return getAdminStub(env).fetch(request);
     }
 
-    // ── POST /probe — server checks if ip:port is reachable (LAN mode) ────────
-    // IMPORTANT: This only works for same-network hosts.
-    // For tunnel mode (300km+), skip this — connection is always through WS.
-    if (path === '/probe' && request.method === 'POST') {
-      try {
-        const { ip, port } = await request.json();
-        if (!ip || !port) return jsonResp({ ok: false, reason: 'Missing ip or port' }, 400);
-
-        // Skip probe for private/LAN IPs — they're unreachable from Cloudflare
-        if (
-          ip.startsWith('192.168.') ||
-          ip.startsWith('10.')      ||
-          ip.startsWith('172.')
-        ) {
-          // Return ok:true optimistically for LAN IPs — client is on same network
-          return jsonResp({ ok: true, note: 'LAN IP — skipped server-side probe' });
-        }
-
-        const { connect } = await import('cloudflare:sockets');
-        let reachable = false;
-        try {
-          const sock = connect(
-            { hostname: ip, port: parseInt(port) },
-            { allowHalfOpen: false }
-          );
-          await Promise.race([
-            sock.opened,
-            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
-          ]);
-          reachable = true;
-          try { await sock.close(); } catch (_) {}
-        } catch (_) {
-          reachable = false;
-        }
-        return jsonResp({ ok: reachable });
-      } catch (e) {
-        return jsonResp({ ok: false, reason: e.message }, 500);
-      }
-    }
+    // /probe removed — LAN mode no longer supported (tunnel-only now)
 
     // ── Admin + validate-code + stats ─────────────────────────────────────────
     if (path.startsWith('/admin/') || path === '/validate-code' || path === '/stats') {
