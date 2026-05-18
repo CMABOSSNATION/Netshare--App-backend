@@ -3,23 +3,17 @@ main               = "src/index.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# ── Durable Object binding ────────────────────────────────────────────────────
 [[durable_objects.bindings]]
 name       = "RELAY"
 class_name = "ProxySession"
 
-# ── Migrations ────────────────────────────────────────────────────────────────
-# v2: was the old tag already on Cloudflare (TcpTunnelSession existed here)
-# v3: delete the old TcpTunnelSession class that no longer exists in code
 [[migrations]]
-tag           = "v3"
+tag             = "v3"
 deleted_classes = ["TcpTunnelSession"]
 
-# v4: create ProxySession using new_sqlite_classes (required on free plan)
 [[migrations]]
 tag                = "v4"
 new_sqlite_classes = ["ProxySession"]
 
-# ── Environment variables ─────────────────────────────────────────────────────
 [vars]
 ADMIN_KEY = "change-me"
