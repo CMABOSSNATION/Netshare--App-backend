@@ -3,13 +3,20 @@ main               = "src/index.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
+# ── Durable Object binding ─────────────────────────────────────────────────────
+# "RELAY" is the binding name used in JS: env.RELAY.get(...)
+# "ProxySession" is the class exported from relay.js
 [[durable_objects.bindings]]
 name       = "RELAY"
 class_name = "ProxySession"
 
+# ── Migrations ────────────────────────────────────────────────────────────────
+# Use new_classes (not new_sqlite_classes) since we use storage.put/get/list
+# (KV-style storage), not SQLite. Change tag to v5 to force re-migration.
 [[migrations]]
-tag = "v4"
-new_sqlite_classes = ["ProxySession"]
+tag         = "v5"
+new_classes = ["ProxySession"]
 
+# ── Environment variables ─────────────────────────────────────────────────────
 [vars]
 ADMIN_KEY = "change-me"
