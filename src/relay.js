@@ -1,25 +1,32 @@
 /**
  * relay.js — NetShare Proxy Session Durable Object
  *
- * Handles session signalling for the HTTP proxy architecture.
- * Traffic never flows through here — only IP:port exchange.
+ * ── Two modes of operation ────────────────────────────────────────────────────
+ *
+ * MODE 1: Same-WiFi (LAN) — short range
+ *   Host registers ip:port → client gets ip:port → configures Android proxy
+ *   Traffic flows directly host ↔ client (NOT through Cloudflare)
+ *
+ * MODE 2: WebSocket Tunnel — any distance (300km+)
+ *   Host connects via WebSocket to /ws/host/:code
+ *   Client connects via WebSocket to /ws/client/:code
+ *   This DO pairs them and pipes raw bytes both ways through Cloudflare
+ *   Client-side: a local SOCKS/HTTP proxy server bridges the WebSocket tunnel
  *
  * Session lifecycle:
- *   1. Host POSTs { ip, port } to /register → gets { code, sessionId }
+ *   1. Host POSTs { ip, port, tunnelMode } to /register → gets { code, sessionId }
  *   2. Host POSTs to /ping every 30s to keep session alive
- *   3. Client GETs /join/:code → gets { ip, port, sessionId }
- *   4. Client configures Android WiFi proxy to ip:port
- *   5. All traffic flows directly host ↔ client (NOT through Cloudflare)
- *   6. Host POSTs /deregister when done
+ *   3. Client GETs /join/:code → gets { ip, port, sessionId, tunnelMode }
+ *   4a. Same-WiFi: client sets Android proxy to ip:port
+ *   4b. Tunnel mode: host + client both open WSs → DO bridges them
+ *   5. Host POSTs /deregister when done
  */
 
-const SESSION_TTL_MS   = 2 * 60 * 60 * 1000; // 2 hours
-const CODE_TTL_MS      = 5 * 60 * 1000;       // code expires if host doesn't ping
-const PING_GRACE_MS    = 90 * 1000;           // 90s grace before session dies
-const CODE_LENGTH      = 4;
-const CODE_CHARS       = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const ALARM_INTERVAL   = 60_000;              // cleanup check every 60s
-const HOURLY_RATE      = 0.50;
+const SESSION_TTL_MS  = 2 * 60 * 60 * 1000; // 2 hours
+const PING_GRACE_MS   = 90 * 1000;           // 90s grace before session dies
+const CODE_LENGTH     = 4;
+const CODE_CHARS      = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const ALARM_INTERVAL  = 60_000;              // cleanup check every 60s
 
 function randomCode(existing) {
   let code;
@@ -29,6 +36,12 @@ function randomCode(existing) {
     ).join('');
   } while (existing.has(code));
   return code;
+}
+
+function randomChars(n) {
+  return Array.from({ length: n }, () =>
+    CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]
+  ).join('');
 }
 
 function cors() {
@@ -43,31 +56,26 @@ function jsonResp(data, status = 200) {
   return Response.json(data, { status, headers: cors() });
 }
 
-function randomChars(n) {
-  return Array.from({ length: n }, () =>
-    CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)]
-  ).join('');
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 export class ProxySession {
   constructor(state, env) {
     this.state = state;
     this.env   = env;
 
-    // Proxy sessions: code → { ip, port, sessionId, lastPing, hostId }
-    this.proxySessions  = new Map();
+    // Proxy sessions: code → { ip, port, sessionId, lastPing, tunnelMode }
+    this.proxySessions = new Map();
     // sessionId → code (reverse lookup)
-    this.sessionIdMap   = new Map();
+    this.sessionIdMap  = new Map();
 
-    // Legacy broker state (kept for backward compat)
-    this.sessions          = new Map();
-    this.connections       = new Map();
-    this.joinWaiters       = new Map();
-    this.hostRegistry      = new Map();
-    this.sessionIpCounters = new Map();
-    this._alarmScheduled   = false;
-    this._restored         = false;
+    // ── WebSocket tunnel state ──────────────────────────────────────────────
+    // For long-distance mode: pairs host WS ↔ client WS per session code
+    // code → { host: WebSocket|null, client: WebSocket|null }
+    this.tunnelPairs   = new Map();
+
+    // Admin / access codes
+    this.hostRegistry  = new Map();
+    this._alarmScheduled = false;
+    this._restored     = false;
   }
 
   // ── Restore state from storage ───────────────────────────────────────────
@@ -117,10 +125,21 @@ export class ProxySession {
         this.proxySessions.delete(code);
         this.sessionIdMap.delete(s.sessionId);
         await this._removeSession(code);
+        // Clean up any tunnel pair
+        this._closeTunnelPair(code);
         console.log(`[relay] Session ${code} expired`);
       }
     }
     if (this.proxySessions.size > 0) await this._scheduleAlarm();
+  }
+
+  // ── Close both sides of a tunnel pair ───────────────────────────────────
+  _closeTunnelPair(code) {
+    const pair = this.tunnelPairs.get(code);
+    if (!pair) return;
+    try { pair.host?.close(1000, 'Session ended'); }   catch (_) {}
+    try { pair.client?.close(1000, 'Session ended'); } catch (_) {}
+    this.tunnelPairs.delete(code);
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -137,16 +156,24 @@ export class ProxySession {
     // ── POST /register ───────────────────────────────────────────────────────
     if (path === '/register' && request.method === 'POST') {
       try {
-        const { ip, port, type } = await request.json();
-        if (!ip || !port) return jsonResp({ error: 'Missing ip or port' }, 400);
+        const { ip, port, type, tunnelMode } = await request.json();
+        // tunnelMode=true means host wants WS relay (for 300km+ use)
+        // tunnelMode=false/undefined means same-WiFi LAN proxy
+        if (!tunnelMode && (!ip || !port)) {
+          return jsonResp({ error: 'Missing ip or port' }, 400);
+        }
 
         const code      = randomCode(this.proxySessions);
         const sessionId = crypto.randomUUID();
         const session   = {
-          code, sessionId, ip, port: parseInt(port),
-          type:      type || 'http-proxy',
-          lastPing:  Date.now(),
-          createdAt: Date.now(),
+          code,
+          sessionId,
+          ip:          ip || null,
+          port:        port ? parseInt(port) : null,
+          type:        type || 'http-proxy',
+          tunnelMode:  !!tunnelMode,
+          lastPing:    Date.now(),
+          createdAt:   Date.now(),
         };
 
         this.proxySessions.set(code, session);
@@ -154,8 +181,13 @@ export class ProxySession {
         await this._saveSession(session);
         await this._scheduleAlarm();
 
-        console.log(`[relay] Registered session ${code} for ${ip}:${port}`);
-        return jsonResp({ code, sessionId });
+        // Pre-create tunnel pair slot if tunnelMode
+        if (tunnelMode) {
+          this.tunnelPairs.set(code, { host: null, client: null });
+        }
+
+        console.log(`[relay] Registered session ${code} tunnelMode=${tunnelMode}`);
+        return jsonResp({ code, sessionId, tunnelMode: !!tunnelMode });
       } catch (e) {
         return jsonResp({ error: e.message }, 500);
       }
@@ -166,11 +198,8 @@ export class ProxySession {
       const code = path.replace('/join/', '').toUpperCase().trim();
       const s    = this.proxySessions.get(code);
 
-      if (!s) {
-        return jsonResp({ error: 'Session code not found or expired' }, 404);
-      }
+      if (!s) return jsonResp({ error: 'Session code not found or expired' }, 404);
 
-      // Check session freshness
       if (Date.now() - s.lastPing > PING_GRACE_MS) {
         this.proxySessions.delete(code);
         this.sessionIdMap.delete(s.sessionId);
@@ -179,10 +208,11 @@ export class ProxySession {
       }
 
       return jsonResp({
-        ip:        s.ip,
-        port:      s.port,
-        sessionId: s.sessionId,
-        code:      s.code,
+        ip:         s.ip,
+        port:       s.port,
+        sessionId:  s.sessionId,
+        code:       s.code,
+        tunnelMode: s.tunnelMode,
       });
     }
 
@@ -213,6 +243,7 @@ export class ProxySession {
           this.proxySessions.delete(code);
           this.sessionIdMap.delete(sessionId);
           await this._removeSession(code);
+          this._closeTunnelPair(code);
           console.log(`[relay] Deregistered session ${code}`);
         }
         return jsonResp({ ok: true });
@@ -221,16 +252,33 @@ export class ProxySession {
       }
     }
 
+    // ── WebSocket Tunnel: Host connects ───────────────────────────────────────
+    // Host: GET /ws/host/:code  (with Upgrade: websocket)
+    // This is the long-distance tunnel endpoint. The host's ProxyService opens
+    // one WS per client connection that needs to be tunneled.
+    if (path.startsWith('/ws/host/') && request.headers.get('Upgrade') === 'websocket') {
+      const code = path.replace('/ws/host/', '').toUpperCase().trim();
+      return this._handleTunnelHost(request, code);
+    }
+
+    // ── WebSocket Tunnel: Client connects ─────────────────────────────────────
+    // Client: GET /ws/client/:code  (with Upgrade: websocket)
+    if (path.startsWith('/ws/client/') && request.headers.get('Upgrade') === 'websocket') {
+      const code = path.replace('/ws/client/', '').toUpperCase().trim();
+      return this._handleTunnelClient(request, code);
+    }
+
     // ── GET /stats ────────────────────────────────────────────────────────────
     if (path === '/stats') {
       return jsonResp({
         activeSessions: this.proxySessions.size,
         sessions: [...this.proxySessions.values()].map(s => ({
-          code:      s.code,
-          ip:        s.ip,
-          port:      s.port,
-          lastPing:  s.lastPing,
-          createdAt: s.createdAt,
+          code:       s.code,
+          ip:         s.ip,
+          port:       s.port,
+          tunnelMode: s.tunnelMode,
+          lastPing:   s.lastPing,
+          createdAt:  s.createdAt,
         })),
       });
     }
@@ -239,9 +287,9 @@ export class ProxySession {
     if (path === '/validate-code' && request.method === 'POST') {
       try {
         const b = await request.json();
-        const upper = (b.code || '').toUpperCase();
+        const upper    = (b.code || '').toUpperCase();
         const deviceId = (b.deviceId || '').trim();
-        const ac = await this._getAC(upper);
+        const ac  = await this._getAC(upper);
         const now = Date.now();
         if (!ac || !ac.isActive || new Date(ac.expiresAt).getTime() < now)
           return jsonResp({ valid: false, reason: 'Invalid or expired access code' });
@@ -259,7 +307,7 @@ export class ProxySession {
       return this._handleAdmin(request, url);
     }
 
-    // ── Legacy broker WebSocket ───────────────────────────────────────────────
+    // ── Legacy broker WebSocket (backward compat) ─────────────────────────────
     if (request.headers.get('Upgrade') === 'websocket') {
       const { 0: clientWs, 1: serverWs } = new WebSocketPair();
       serverWs.accept();
@@ -267,6 +315,115 @@ export class ProxySession {
     }
 
     return jsonResp({ message: 'NetShare Relay' });
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // WebSocket Tunnel Logic (long-distance / 300km+ mode)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Host connects here. We store their WS. If client already waiting, bridge.
+   *
+   * Protocol over the WS (binary frames):
+   *   Host sends raw bytes from the client socket (what client app sent)
+   *   Host receives raw bytes to forward to the client socket
+   *   This is a raw TCP byte pipe — no framing needed
+   */
+  _handleTunnelHost(request, code) {
+    const session = this.proxySessions.get(code);
+    if (!session) {
+      return new Response('Session not found', { status: 404 });
+    }
+
+    const { 0: clientWs, 1: serverWs } = new WebSocketPair();
+    serverWs.accept();
+
+    // Store host WS
+    let pair = this.tunnelPairs.get(code);
+    if (!pair) { pair = { host: null, client: null }; this.tunnelPairs.set(code, pair); }
+    pair.host = serverWs;
+
+    serverWs.addEventListener('message', (evt) => {
+      // Forward host → client
+      const p = this.tunnelPairs.get(code);
+      if (p?.client && p.client.readyState === WebSocket.OPEN) {
+        try { p.client.send(evt.data); } catch (_) {}
+      }
+    });
+
+    serverWs.addEventListener('close', () => {
+      const p = this.tunnelPairs.get(code);
+      if (p) {
+        p.host = null;
+        // Close client side too
+        try { p.client?.close(1000, 'Host disconnected'); } catch (_) {}
+        if (!p.host && !p.client) this.tunnelPairs.delete(code);
+      }
+    });
+
+    serverWs.addEventListener('error', () => {
+      const p = this.tunnelPairs.get(code);
+      if (p) { p.host = null; }
+    });
+
+    // If client is already waiting, send "ready" signal to both
+    if (pair.client && pair.client.readyState === WebSocket.OPEN) {
+      try { serverWs.send(JSON.stringify({ type: 'paired' })); }   catch (_) {}
+      try { pair.client.send(JSON.stringify({ type: 'paired' })); } catch (_) {}
+    } else {
+      try { serverWs.send(JSON.stringify({ type: 'waiting_for_client' })); } catch (_) {}
+    }
+
+    return new Response(null, { status: 101, webSocket: clientWs });
+  }
+
+  /**
+   * Client connects here. We store their WS. If host already waiting, bridge.
+   */
+  _handleTunnelClient(request, code) {
+    const session = this.proxySessions.get(code);
+    if (!session) {
+      return new Response('Session not found', { status: 404 });
+    }
+
+    const { 0: clientWs, 1: serverWs } = new WebSocketPair();
+    serverWs.accept();
+
+    let pair = this.tunnelPairs.get(code);
+    if (!pair) { pair = { host: null, client: null }; this.tunnelPairs.set(code, pair); }
+    pair.client = serverWs;
+
+    serverWs.addEventListener('message', (evt) => {
+      // Forward client → host
+      const p = this.tunnelPairs.get(code);
+      if (p?.host && p.host.readyState === WebSocket.OPEN) {
+        try { p.host.send(evt.data); } catch (_) {}
+      }
+    });
+
+    serverWs.addEventListener('close', () => {
+      const p = this.tunnelPairs.get(code);
+      if (p) {
+        p.client = null;
+        try { p.host?.close(1000, 'Client disconnected'); } catch (_) {}
+        if (!p.host && !p.client) this.tunnelPairs.delete(code);
+      }
+    });
+
+    serverWs.addEventListener('error', () => {
+      const p = this.tunnelPairs.get(code);
+      if (p) { p.client = null; }
+    });
+
+    // If host already connected, signal both parties they're paired
+    if (pair.host && pair.host.readyState === WebSocket.OPEN) {
+      try { serverWs.send(JSON.stringify({ type: 'paired' })); }  catch (_) {}
+      try { pair.host.send(JSON.stringify({ type: 'paired' })); } catch (_) {}
+    } else {
+      try { serverWs.send(JSON.stringify({ type: 'waiting_for_host' })); } catch (_) {}
+    }
+
+    return new Response(null, { status: 101, webSocket: clientWs });
   }
 
   // ── Access code helpers ───────────────────────────────────────────────────
@@ -287,9 +444,15 @@ export class ProxySession {
   }
 
   _upsertHost(hostId, updates) {
-    const e = this.hostRegistry.get(hostId) || { hostId, isOnline: false, weeklyEarnings: 0, weeklyUptimeHours: 0, totalUptimeHours: 0, lastSeen: Date.now(), _onlineSince: null };
-    const m = { ...e, ...updates }; this.hostRegistry.set(hostId, m);
-    this.state.storage.put(`host:${hostId}`, JSON.stringify(m)).catch(() => {}); return m;
+    const e = this.hostRegistry.get(hostId) || {
+      hostId, isOnline: false, weeklyEarnings: 0,
+      weeklyUptimeHours: 0, totalUptimeHours: 0,
+      lastSeen: Date.now(), _onlineSince: null,
+    };
+    const m = { ...e, ...updates };
+    this.hostRegistry.set(hostId, m);
+    this.state.storage.put(`host:${hostId}`, JSON.stringify(m)).catch(() => {});
+    return m;
   }
 
   // ── Admin routes ──────────────────────────────────────────────────────────
@@ -301,6 +464,7 @@ export class ProxySession {
         activeSessions: this.proxySessions.size,
         totalHosts:     this.hostRegistry.size,
         onlineHosts:    [...this.hostRegistry.values()].filter(h => h.isOnline).length,
+        activeTunnels:  this.tunnelPairs.size,
       });
     }
 
@@ -316,8 +480,16 @@ export class ProxySession {
         const codes = [];
         for (let i = 0; i < count; i++) {
           const code = `${randomChars(4)}-${randomChars(4)}`;
-          const data = { isActive: true, label: b.label || '', createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + hours * 3_600_000).toISOString(), claimedBy: null, claimedAt: null };
-          await this._putAC(code, data); codes.push({ code, ...data });
+          const data = {
+            isActive:  true,
+            label:     b.label || '',
+            createdAt: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + hours * 3_600_000).toISOString(),
+            claimedBy: null,
+            claimedAt: null,
+          };
+          await this._putAC(code, data);
+          codes.push({ code, ...data });
         }
         return jsonResp({ codes });
       } catch (e) { return jsonResp({ error: e.message }, 400); }
@@ -337,8 +509,12 @@ export class ProxySession {
     if (p === '/admin/sessions') {
       return jsonResp({
         sessions: [...this.proxySessions.values()].map(s => ({
-          code: s.code, ip: s.ip, port: s.port,
-          lastPing: s.lastPing, createdAt: s.createdAt,
+          code:       s.code,
+          ip:         s.ip,
+          port:       s.port,
+          tunnelMode: s.tunnelMode,
+          lastPing:   s.lastPing,
+          createdAt:  s.createdAt,
         })),
       });
     }
