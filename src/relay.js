@@ -20,13 +20,23 @@
  *   4a. Same-WiFi: client sets Android proxy to ip:port
  *   4b. Tunnel mode: host + client both open WSs → DO bridges them
  *   5. Host POSTs /deregister when done
+ *
+ * ── FIX LOG ───────────────────────────────────────────────────────────────────
+ * FIX 1: PING_GRACE_MS raised 90s → 300s. 90s was too tight for mobile networks.
+ * FIX 2: WS heartbeat added. Server sends JSON ping frame every 25s so Cloudflare
+ *         never silently drops idle WebSockets (CF kills WS idle > ~100s).
+ * FIX 3: Reconnect window added. When one side disconnects, the other side is NOT
+ *         immediately closed. A 30s window allows the dropped peer to reconnect.
+ *         Only if no reconnect happens within the window do we close the other side.
  */
 
-const SESSION_TTL_MS  = 2 * 60 * 60 * 1000; // 2 hours
-const PING_GRACE_MS   = 90 * 1000;           // 90s grace before session dies
-const CODE_LENGTH     = 4;
-const CODE_CHARS      = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const ALARM_INTERVAL  = 60_000;              // cleanup check every 60s
+const SESSION_TTL_MS       = 2 * 60 * 60 * 1000; // 2 hours
+const PING_GRACE_MS        = 300 * 1000;          // FIX 1: 300s grace (was 90s)
+const CODE_LENGTH          = 4;
+const CODE_CHARS           = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const ALARM_INTERVAL       = 60_000;              // cleanup check every 60s
+const WS_HEARTBEAT_MS      = 25_000;              // FIX 2: WS ping every 25s
+const RECONNECT_WINDOW_MS  = 30_000;              // FIX 3: 30s reconnect grace
 
 function randomCode(existing) {
   let code;
@@ -69,7 +79,9 @@ export class ProxySession {
 
     // ── WebSocket tunnel state ──────────────────────────────────────────────
     // For long-distance mode: pairs host WS ↔ client WS per session code
-    // code → { host: WebSocket|null, client: WebSocket|null }
+    // code → { host: WebSocket|null, client: WebSocket|null,
+    //           hostReconnectTimer: id|null, clientReconnectTimer: id|null,
+    //           hostHeartbeat: id|null, clientHeartbeat: id|null }
     this.tunnelPairs   = new Map();
 
     // Admin / access codes
@@ -137,9 +149,26 @@ export class ProxySession {
   _closeTunnelPair(code) {
     const pair = this.tunnelPairs.get(code);
     if (!pair) return;
+    // Clear all timers
+    if (pair.hostHeartbeat)        clearInterval(pair.hostHeartbeat);
+    if (pair.clientHeartbeat)      clearInterval(pair.clientHeartbeat);
+    if (pair.hostReconnectTimer)   clearTimeout(pair.hostReconnectTimer);
+    if (pair.clientReconnectTimer) clearTimeout(pair.clientReconnectTimer);
     try { pair.host?.close(1000, 'Session ended'); }   catch (_) {}
     try { pair.client?.close(1000, 'Session ended'); } catch (_) {}
     this.tunnelPairs.delete(code);
+  }
+
+  // FIX 2: Start a heartbeat interval that sends JSON ping frames
+  // so Cloudflare never kills the WS for idleness.
+  _startHeartbeat(ws, code, side) {
+    return setInterval(() => {
+      try {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'ping' }));
+        }
+      } catch (_) {}
+    }, WS_HEARTBEAT_MS);
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -157,8 +186,6 @@ export class ProxySession {
     if (path === '/register' && request.method === 'POST') {
       try {
         const { ip, port, type, tunnelMode } = await request.json();
-        // tunnelMode=true means host wants WS relay (for 300km+ use)
-        // tunnelMode=false/undefined means same-WiFi LAN proxy
         if (!tunnelMode && (!ip || !port)) {
           return jsonResp({ error: 'Missing ip or port' }, 400);
         }
@@ -183,7 +210,11 @@ export class ProxySession {
 
         // Pre-create tunnel pair slot if tunnelMode
         if (tunnelMode) {
-          this.tunnelPairs.set(code, { host: null, client: null });
+          this.tunnelPairs.set(code, {
+            host: null, client: null,
+            hostHeartbeat: null, clientHeartbeat: null,
+            hostReconnectTimer: null, clientReconnectTimer: null,
+          });
         }
 
         console.log(`[relay] Registered session ${code} tunnelMode=${tunnelMode}`);
@@ -253,16 +284,12 @@ export class ProxySession {
     }
 
     // ── WebSocket Tunnel: Host connects ───────────────────────────────────────
-    // Host: GET /ws/host/:code  (with Upgrade: websocket)
-    // This is the long-distance tunnel endpoint. The host's ProxyService opens
-    // one WS per client connection that needs to be tunneled.
     if (path.startsWith('/ws/host/') && request.headers.get('Upgrade') === 'websocket') {
       const code = path.replace('/ws/host/', '').toUpperCase().trim();
       return this._handleTunnelHost(request, code);
     }
 
     // ── WebSocket Tunnel: Client connects ─────────────────────────────────────
-    // Client: GET /ws/client/:code  (with Upgrade: websocket)
     if (path.startsWith('/ws/client/') && request.headers.get('Upgrade') === 'websocket') {
       const code = path.replace('/ws/client/', '').toUpperCase().trim();
       return this._handleTunnelClient(request, code);
@@ -321,14 +348,6 @@ export class ProxySession {
   // WebSocket Tunnel Logic (long-distance / 300km+ mode)
   // ════════════════════════════════════════════════════════════════════════════
 
-  /**
-   * Host connects here. We store their WS. If client already waiting, bridge.
-   *
-   * Protocol over the WS (binary frames):
-   *   Host sends raw bytes from the client socket (what client app sent)
-   *   Host receives raw bytes to forward to the client socket
-   *   This is a raw TCP byte pipe — no framing needed
-   */
   _handleTunnelHost(request, code) {
     const session = this.proxySessions.get(code);
     if (!session) {
@@ -338,12 +357,38 @@ export class ProxySession {
     const { 0: clientWs, 1: serverWs } = new WebSocketPair();
     serverWs.accept();
 
-    // Store host WS
     let pair = this.tunnelPairs.get(code);
-    if (!pair) { pair = { host: null, client: null }; this.tunnelPairs.set(code, pair); }
+    if (!pair) {
+      pair = {
+        host: null, client: null,
+        hostHeartbeat: null, clientHeartbeat: null,
+        hostReconnectTimer: null, clientReconnectTimer: null,
+      };
+      this.tunnelPairs.set(code, pair);
+    }
+
+    // FIX 3: Cancel any pending reconnect timer for host side
+    if (pair.hostReconnectTimer) {
+      clearTimeout(pair.hostReconnectTimer);
+      pair.hostReconnectTimer = null;
+    }
+    // Close old host WS if still lingering
+    if (pair.host) {
+      try { pair.host.close(1000, 'Replaced by new connection'); } catch (_) {}
+      if (pair.hostHeartbeat) { clearInterval(pair.hostHeartbeat); pair.hostHeartbeat = null; }
+    }
+
     pair.host = serverWs;
 
+    // FIX 2: Start heartbeat for host WS
+    pair.hostHeartbeat = this._startHeartbeat(serverWs, code, 'host');
+
     serverWs.addEventListener('message', (evt) => {
+      // Ignore our own heartbeat pings
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg?.type === 'ping' || msg?.type === 'pong') return;
+      } catch (_) {}
       // Forward host → client
       const p = this.tunnelPairs.get(code);
       if (p?.client && p.client.readyState === WebSocket.OPEN) {
@@ -351,14 +396,22 @@ export class ProxySession {
       }
     });
 
-    serverWs.addEventListener('close', () => {
+    serverWs.addEventListener('close', (evt) => {
       const p = this.tunnelPairs.get(code);
-      if (p) {
-        p.host = null;
-        // Close client side too
-        try { p.client?.close(1000, 'Host disconnected'); } catch (_) {}
-        if (!p.host && !p.client) this.tunnelPairs.delete(code);
-      }
+      if (!p) return;
+      if (pair.hostHeartbeat) { clearInterval(pair.hostHeartbeat); pair.hostHeartbeat = null; }
+      p.host = null;
+      console.log(`[relay] Host WS closed for ${code}, code=${evt.code}. Waiting ${RECONNECT_WINDOW_MS}ms for reconnect.`);
+
+      // FIX 3: Give host time to reconnect before killing client
+      p.hostReconnectTimer = setTimeout(() => {
+        const p2 = this.tunnelPairs.get(code);
+        if (p2 && !p2.host) {
+          console.log(`[relay] Host did not reconnect for ${code}, closing client.`);
+          try { p2.client?.close(1000, 'Host disconnected'); } catch (_) {}
+          if (!p2.host && !p2.client) this.tunnelPairs.delete(code);
+        }
+      }, RECONNECT_WINDOW_MS);
     });
 
     serverWs.addEventListener('error', () => {
@@ -366,7 +419,7 @@ export class ProxySession {
       if (p) { p.host = null; }
     });
 
-    // If client is already waiting, send "ready" signal to both
+    // Signal pairing status
     if (pair.client && pair.client.readyState === WebSocket.OPEN) {
       try { serverWs.send(JSON.stringify({ type: 'paired' })); }   catch (_) {}
       try { pair.client.send(JSON.stringify({ type: 'paired' })); } catch (_) {}
@@ -377,9 +430,6 @@ export class ProxySession {
     return new Response(null, { status: 101, webSocket: clientWs });
   }
 
-  /**
-   * Client connects here. We store their WS. If host already waiting, bridge.
-   */
   _handleTunnelClient(request, code) {
     const session = this.proxySessions.get(code);
     if (!session) {
@@ -390,10 +440,37 @@ export class ProxySession {
     serverWs.accept();
 
     let pair = this.tunnelPairs.get(code);
-    if (!pair) { pair = { host: null, client: null }; this.tunnelPairs.set(code, pair); }
+    if (!pair) {
+      pair = {
+        host: null, client: null,
+        hostHeartbeat: null, clientHeartbeat: null,
+        hostReconnectTimer: null, clientReconnectTimer: null,
+      };
+      this.tunnelPairs.set(code, pair);
+    }
+
+    // FIX 3: Cancel any pending reconnect timer for client side
+    if (pair.clientReconnectTimer) {
+      clearTimeout(pair.clientReconnectTimer);
+      pair.clientReconnectTimer = null;
+    }
+    // Close old client WS if still lingering
+    if (pair.client) {
+      try { pair.client.close(1000, 'Replaced by new connection'); } catch (_) {}
+      if (pair.clientHeartbeat) { clearInterval(pair.clientHeartbeat); pair.clientHeartbeat = null; }
+    }
+
     pair.client = serverWs;
 
+    // FIX 2: Start heartbeat for client WS
+    pair.clientHeartbeat = this._startHeartbeat(serverWs, code, 'client');
+
     serverWs.addEventListener('message', (evt) => {
+      // Ignore our own heartbeat pings
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg?.type === 'ping' || msg?.type === 'pong') return;
+      } catch (_) {}
       // Forward client → host
       const p = this.tunnelPairs.get(code);
       if (p?.host && p.host.readyState === WebSocket.OPEN) {
@@ -401,13 +478,22 @@ export class ProxySession {
       }
     });
 
-    serverWs.addEventListener('close', () => {
+    serverWs.addEventListener('close', (evt) => {
       const p = this.tunnelPairs.get(code);
-      if (p) {
-        p.client = null;
-        try { p.host?.close(1000, 'Client disconnected'); } catch (_) {}
-        if (!p.host && !p.client) this.tunnelPairs.delete(code);
-      }
+      if (!p) return;
+      if (pair.clientHeartbeat) { clearInterval(pair.clientHeartbeat); pair.clientHeartbeat = null; }
+      p.client = null;
+      console.log(`[relay] Client WS closed for ${code}, code=${evt.code}. Waiting ${RECONNECT_WINDOW_MS}ms for reconnect.`);
+
+      // FIX 3: Give client time to reconnect before killing host
+      p.clientReconnectTimer = setTimeout(() => {
+        const p2 = this.tunnelPairs.get(code);
+        if (p2 && !p2.client) {
+          console.log(`[relay] Client did not reconnect for ${code}, closing host.`);
+          try { p2.host?.close(1000, 'Client disconnected'); } catch (_) {}
+          if (!p2.host && !p2.client) this.tunnelPairs.delete(code);
+        }
+      }, RECONNECT_WINDOW_MS);
     });
 
     serverWs.addEventListener('error', () => {
@@ -415,7 +501,7 @@ export class ProxySession {
       if (p) { p.client = null; }
     });
 
-    // If host already connected, signal both parties they're paired
+    // Signal pairing status
     if (pair.host && pair.host.readyState === WebSocket.OPEN) {
       try { serverWs.send(JSON.stringify({ type: 'paired' })); }  catch (_) {}
       try { pair.host.send(JSON.stringify({ type: 'paired' })); } catch (_) {}
