@@ -377,12 +377,16 @@ export class ProxySession {
     pair.hostHeartbeat = this._startHeartbeat(serverWs, code, 'host');
 
     serverWs.addEventListener('message', (evt) => {
-      // Ignore our own heartbeat pings
-      try {
-        const msg = JSON.parse(evt.data);
-        if (msg?.type === 'ping' || msg?.type === 'pong') return;
-      } catch (_) {}
-      // Forward host → client
+      // Ignore heartbeat pings in both text and binary forms
+      if (typeof evt.data === 'string') {
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg?.type === 'ping' || msg?.type === 'pong') return;
+        } catch (_) {}
+        // Don't forward control text frames as data
+        return;
+      }
+      // Forward binary host → client only
       const p = this.tunnelPairs.get(code);
       if (p?.client && p.client.readyState === WebSocket.OPEN) {
         try { p.client.send(evt.data); } catch (_) {}
@@ -459,12 +463,16 @@ export class ProxySession {
     pair.clientHeartbeat = this._startHeartbeat(serverWs, code, 'client');
 
     serverWs.addEventListener('message', (evt) => {
-      // Ignore our own heartbeat pings
-      try {
-        const msg = JSON.parse(evt.data);
-        if (msg?.type === 'ping' || msg?.type === 'pong') return;
-      } catch (_) {}
-      // Forward client → host
+      // Ignore heartbeat pings in both text and binary forms
+      if (typeof evt.data === 'string') {
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg?.type === 'ping' || msg?.type === 'pong') return;
+        } catch (_) {}
+        // Don't forward control text frames as data
+        return;
+      }
+      // Forward binary client → host only
       const p = this.tunnelPairs.get(code);
       if (p?.host && p.host.readyState === WebSocket.OPEN) {
         try { p.host.send(evt.data); } catch (_) {}
